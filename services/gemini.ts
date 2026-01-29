@@ -1,11 +1,114 @@
 
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 
-// Helper function to get AI instance safely
-const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
+/**
+ * Smart Key Management System (KeyPool Engine)
+ * Handles rate limits by rotating through available API keys.
+ */
+class KeyManager {
+  private keys: string[] = [];
+  private currentIndex: number = 0;
+  private cooldowns: Map<string, number> = new Map();
+  private readonly COOLDOWN_TIME = 65000; // ~1 minute cool-down for 429 errors
+
+  constructor() {
+    this.initPool();
+  }
+
+  private initPool() {
+    const env = process.env || {};
+    const foundKeys: { name: string; val: string }[] = [];
+
+    // Prioritize the standard API_KEY if available
+    if (env.API_KEY) foundKeys.push({ name: 'API_KEY', val: env.API_KEY });
+
+    // Automatically discover all VITE_GOOGLE_GENAI_TOKEN variants
+    Object.keys(env).forEach(key => {
+      if (key.startsWith('VITE_GOOGLE_GENAI_TOKEN') && env[key]) {
+        foundKeys.push({ name: key, val: env[key]! });
+      }
+    });
+
+    // Professional sorting: Base first, then _1, _2, _3...
+    foundKeys.sort((a, b) => {
+      if (a.name === 'API_KEY') return -1;
+      if (b.name === 'API_KEY') return 1;
+      return a.name.localeCompare(b.name, undefined, { numeric: true });
+    });
+
+    this.keys = foundKeys.map(k => k.val);
+    console.log(`[KeyManager] Pool initialized with ${this.keys.length} keys.`);
+  }
+
+  public getNextHealthyKey(): string {
+    if (this.keys.length === 0) return process.env.API_KEY || '';
+
+    const now = Date.now();
+    let attempts = 0;
+
+    while (attempts < this.keys.length) {
+      const key = this.keys[this.currentIndex];
+      const cooldownUntil = this.cooldowns.get(key) || 0;
+
+      if (now > cooldownUntil) {
+        const selectedKey = key;
+        // Advance pointer for next call
+        this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+        return selectedKey;
+      }
+
+      // Skip this key and try next
+      this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+      attempts++;
+    }
+
+    // Fallback: If all keys are in cooldown, return the first one (brute force)
+    return this.keys[0];
+  }
+
+  public markAsLimited(key: string) {
+    console.warn(`[KeyManager] Key rate-limited. Cooling down for 60s.`);
+    this.cooldowns.set(key, Date.now() + this.COOLDOWN_TIME);
+  }
+
+  public getKeyCount() {
+    return this.keys.length;
+  }
+}
+
+const keyManager = new KeyManager();
 
 /**
- * Audio Utilities for Live API and TTS
+ * Resilience Wrapper: Executes an AI operation with automatic retry on key rotation.
+ */
+async function executeWithRotation<T>(operation: (ai: GoogleGenAI) => Promise<T>): Promise<T> {
+  let lastError: any;
+  const maxRetries = Math.min(5, keyManager.getKeyCount() || 1);
+
+  for (let i = 0; i < maxRetries; i++) {
+    const key = keyManager.getNextHealthyKey();
+    const ai = new GoogleGenAI({ apiKey: key });
+
+    try {
+      return await operation(ai);
+    } catch (err: any) {
+      lastError = err;
+      const errorMsg = err.message?.toLowerCase() || '';
+      
+      // Check for Rate Limit (429) or Quota Exceeded
+      if (errorMsg.includes('429') || errorMsg.includes('quota') || errorMsg.includes('limit')) {
+        keyManager.markAsLimited(key);
+        continue; // Try next key in pool
+      }
+      
+      throw err; // For other errors (syntax, auth), fail immediately
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Audio Utilities
  */
 export function decodeBase64(base64: string) {
   const binaryString = atob(base64);
@@ -46,81 +149,69 @@ export async function decodeAudioData(
 }
 
 /**
- * Text-to-Speech for Lesson Content
+ * AI Services with Pool Support
  */
+
 export const generateLessonSpeech = async (text: string) => {
-  const ai = getAI();
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash-preview-tts",
-    contents: [{ parts: [{ text: `خوانش شمرده و آموزشی متن زیر برای دانشجو: ${text}` }] }],
-    config: {
-      responseModalities: [Modality.AUDIO],
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: { voiceName: 'Kore' },
+  return executeWithRotation(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash-preview-tts",
+      contents: [{ parts: [{ text: `خوانش شمرده و آموزشی متن زیر برای دانشجو: ${text}` }] }],
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
       },
-    },
+    });
+    return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   });
-  return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
 };
 
-/**
- * Normal text generation for lesson context and chat.
- */
 export const getAITeacherResponse = async (prompt: string, context: string, userName: string) => {
-  const ai = getAI();
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-pro-preview',
-    contents: `Rich Learning Context: ${context}\n\nStudent's Current Query: ${prompt}`,
-    config: {
-      systemInstruction: `تو مربی فوق تخصص برنامه‌نویسی و همراه شخصی "${userName}" هستی. 
-      تو به سه منبع اطلاعاتی دسترسی داری: ۱. متن آموزشی درس، ۲. کد مرجع (Target Code) و ۳. کدی که دانشجو تا این لحظه تایپ کرده است (Student Code).
-      وظیفه تو:
-      - اگر دانشجو سوالی در مورد منطق کد یا معنای خطوط پرسید، مثل یک توسعه‌دهنده ارشد با لحنی صمیمی و برادرانه توضیح بده.
-      - کدهای دانشجو را با کد مرجع مقایسه کن. اگر اشتباهی دارد (غلط املایی یا منطقی)، به او گوشزد کن.
-      - از عبارات تشویقی استفاده کن. بخش‌های مهم کد را در پاسخ با <hl>...</hl> مشخص کن.
-      - او را همیشه با نام کوچکش (${userName}) صدا بزن.`,
-    },
+  return executeWithRotation(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-pro-preview',
+      contents: `Rich Learning Context: ${context}\n\nStudent's Current Query: ${prompt}`,
+      config: {
+        systemInstruction: `تو مربی فوق تخصص برنامه‌نویسی و همراه شخصی "${userName}" هستی. 
+        تو به سه منبع اطلاعاتی دسترسی داری: ۱. متن آموزشی درس، ۲. کد مرجع و ۳. کدی که دانشجو تایپ کرده.
+        وظیفه تو: توضیح منطق کد، مقایسه با مرجع و تشویق دانشجوست. پاسخ‌ها به فارسی باشد. کدهای مهم را در <hl>...</hl> قرار بده.`,
+      },
+    });
+    return response.text || '';
   });
-  return response.text || '';
 };
 
-/**
- * Teacher-AI Collaboration Chat
- */
 export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: any, relatedLessons: string[]) => {
-  const ai = getAI();
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-pro-preview',
-    contents: `Teacher Question: ${teacherPrompt}\n\nTarget Lesson: ${JSON.stringify(currentLesson)}\n\nOther lessons in track: ${relatedLessons.join(', ')}`,
-    config: {
-      systemInstruction: "You are a Senior Academic Peer AI for Teachers. Analyze if the proposed changes are scientifically accurate and consistent with the curriculum flow. Be honest, professional, and blunt if something is wrong. Speak Persian.",
-    }
+  return executeWithRotation(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-pro-preview',
+      contents: `Teacher Question: ${teacherPrompt}\n\nTarget Lesson: ${JSON.stringify(currentLesson)}\n\nOther lessons: ${relatedLessons.join(', ')}`,
+      config: {
+        systemInstruction: "You are a Senior Academic Peer AI for Teachers. Speak Persian.",
+      }
+    });
+    return response.text || '';
   });
-  return response.text || '';
 };
 
-/**
- * Admin Audit Report
- */
 export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: string[]) => {
-  const ai = getAI();
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-pro-preview',
-    contents: `Lesson to Audit: ${JSON.stringify(lesson)}\n\nRelated Lessons: ${relatedLessonTitles.join(', ')}`,
-    config: {
-      systemInstruction: "You are a Senior Academic Auditor for Danesh Yar Academy. Examine the provided lesson for technical accuracy and clarity. Provide a detailed report in Persian (Farsi).",
-    },
+  return executeWithRotation(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-pro-preview',
+      contents: `Lesson to Audit: ${JSON.stringify(lesson)}\n\nRelated: ${relatedLessonTitles.join(', ')}`,
+      config: {
+        systemInstruction: "You are a Senior Academic Auditor for Danesh Yar Academy. Speak Persian.",
+      },
+    });
+    return response.text || '';
   });
-  return response.text || '';
 };
 
-/**
- * Live Audio Session Setup
- */
 export const connectLiveTeacher = async (callbacks: any, userName: string, context: string) => {
-  const ai = getAI();
+  // Live API rotation is handled by selecting a healthy key once at the start of connection
+  const ai = new GoogleGenAI({ apiKey: keyManager.getNextHealthyKey() });
   return ai.live.connect({
     model: 'gemini-2.5-flash-native-audio-preview-12-2025',
     callbacks,
@@ -129,10 +220,7 @@ export const connectLiveTeacher = async (callbacks: any, userName: string, conte
       speechConfig: {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
       },
-      systemInstruction: `تو مربی زنده و شخصی "${userName}" هستی. لحن تو باید صمیمی، حرفه‌ای و مثل یک مربی همراه باشد. 
-      تو به محتوای زیر دسترسی داری: ${context}.
-      اگر دانشجو در حال تمرین است، به او در مورد کدهایش بازخورد بده. اشتباهاتش را با مهربانی بگو. 
-      مکالمه را بسیار انسانی و گرم پیش ببر. او را با نام (${userName}) صدا بزن.`,
+      systemInstruction: `تو مربی زنده و شخصی "${userName}" هستی. صمیمی و حرفه‌ای باش. کانتکست: ${context}`,
       outputAudioTranscription: {},
       inputAudioTranscription: {},
     }
@@ -140,27 +228,24 @@ export const connectLiveTeacher = async (callbacks: any, userName: string, conte
 };
 
 export const generateLessonSuggestion = async (discipline: string, topic: string, previousLessons: string[]) => {
-  const ai = getAI();
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-pro-preview',
-    contents: `Discipline: ${discipline}. Topic: ${topic}. Context of existing lessons: ${previousLessons.join(', ')}. Create a new lesson structure.`,
-    config: {
-      systemInstruction: `You are a curriculum designer for Danesh Yar Academy. 
-      Rules:
-      1. 'title' and 'explanation' MUST be in fluent, professional Persian.
-      2. 'content' MUST be standard, high-quality, and clean English code relevant to the topic.
-      Output in JSON.`,
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          title: { type: Type.STRING },
-          content: { type: Type.STRING },
-          explanation: { type: Type.STRING },
-        },
-        required: ["title", "content", "explanation"]
+  return executeWithRotation(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-pro-preview',
+      contents: `Discipline: ${discipline}. Topic: ${topic}. History: ${previousLessons.join(', ')}.`,
+      config: {
+        systemInstruction: "You are a curriculum designer. Output JSON with fields: title, content, explanation.",
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING },
+            content: { type: Type.STRING },
+            explanation: { type: Type.STRING },
+          },
+          required: ["title", "content", "explanation"]
+        }
       }
-    }
+    });
+    return JSON.parse(response.text || '{}');
   });
-  return JSON.parse(response.text || '{}');
 };
