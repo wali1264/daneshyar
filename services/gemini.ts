@@ -16,16 +16,17 @@ class KeyManager {
   }
 
   private initPool() {
-    const env = process.env || {};
+    // Safely access process.env in browser using the shim or direct access
+    const safeEnv = (typeof process !== 'undefined' && process.env) ? process.env : (window as any).process?.env || {};
     const foundKeys: { name: string; val: string }[] = [];
 
     // Prioritize the standard API_KEY if available
-    if (env.API_KEY) foundKeys.push({ name: 'API_KEY', val: env.API_KEY });
+    if (safeEnv.API_KEY) foundKeys.push({ name: 'API_KEY', val: safeEnv.API_KEY });
 
     // Automatically discover all VITE_GOOGLE_GENAI_TOKEN variants
-    Object.keys(env).forEach(key => {
-      if (key.startsWith('VITE_GOOGLE_GENAI_TOKEN') && env[key]) {
-        foundKeys.push({ name: key, val: env[key]! });
+    Object.keys(safeEnv).forEach(key => {
+      if (key.startsWith('VITE_GOOGLE_GENAI_TOKEN') && safeEnv[key]) {
+        foundKeys.push({ name: key, val: safeEnv[key]! });
       }
     });
 
@@ -41,7 +42,8 @@ class KeyManager {
   }
 
   public getNextHealthyKey(): string {
-    if (this.keys.length === 0) return process.env.API_KEY || '';
+    const safeEnv = (typeof process !== 'undefined' && process.env) ? process.env : (window as any).process?.env || {};
+    if (this.keys.length === 0) return safeEnv.API_KEY || '';
 
     const now = Date.now();
     let attempts = 0;
@@ -62,7 +64,7 @@ class KeyManager {
       attempts++;
     }
 
-    // Fallback: If all keys are in cooldown, return the first one (brute force)
+    // Fallback: If all keys are in cooldown, return the first one
     return this.keys[0];
   }
 
@@ -101,7 +103,7 @@ async function executeWithRotation<T>(operation: (ai: GoogleGenAI) => Promise<T>
         continue; // Try next key in pool
       }
       
-      throw err; // For other errors (syntax, auth), fail immediately
+      throw err; // For other errors, fail immediately
     }
   }
   throw lastError;
@@ -210,7 +212,6 @@ export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: stri
 };
 
 export const connectLiveTeacher = async (callbacks: any, userName: string, context: string) => {
-  // Live API rotation is handled by selecting a healthy key once at the start of connection
   const ai = new GoogleGenAI({ apiKey: keyManager.getNextHealthyKey() });
   return ai.live.connect({
     model: 'gemini-2.5-flash-native-audio-preview-12-2025',
