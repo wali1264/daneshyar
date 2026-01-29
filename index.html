@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
   <head>
@@ -7,11 +8,11 @@
     
     <!-- PWA Meta Tags -->
     <meta name="theme-color" content="#2563eb" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="دانش‌یار" />
-    <link rel="apple-touch-icon" href="/public/icon-192.png" />
-    <link rel="manifest" href="/public/manifest.json" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <link rel="manifest" href="/manifest.json" />
 
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100;400;700&display=swap" rel="stylesheet">
@@ -52,9 +53,9 @@
     <script>
       if ('serviceWorker' in navigator) {
         window.addEventListener('load', () => {
-          navigator.serviceWorker.register('/public/sw.js')
+          navigator.serviceWorker.register('/sw.js')
             .then(reg => console.log('Service Worker registered successfully'))
-            .catch(err => console.log('Service Worker registration failed: ', err));
+            .catch(err => console.error('Service Worker registration failed: ', err));
         });
       }
     </script>

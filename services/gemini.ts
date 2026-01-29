@@ -1,7 +1,8 @@
 
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Helper function to get AI instance safely
+const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 /**
  * Audio Utilities for Live API and TTS
@@ -48,6 +49,7 @@ export async function decodeAudioData(
  * Text-to-Speech for Lesson Content
  */
 export const generateLessonSpeech = async (text: string) => {
+  const ai = getAI();
   const response = await ai.models.generateContent({
     model: "gemini-2.5-flash-preview-tts",
     contents: [{ parts: [{ text: `خوانش شمرده و آموزشی متن زیر برای دانشجو: ${text}` }] }],
@@ -65,9 +67,9 @@ export const generateLessonSpeech = async (text: string) => {
 
 /**
  * Normal text generation for lesson context and chat.
- * Context now includes target code and student's current code.
  */
 export const getAITeacherResponse = async (prompt: string, context: string, userName: string) => {
+  const ai = getAI();
   const response = await ai.models.generateContent({
     model: 'gemini-3-pro-preview',
     contents: `Rich Learning Context: ${context}\n\nStudent's Current Query: ${prompt}`,
@@ -88,6 +90,7 @@ export const getAITeacherResponse = async (prompt: string, context: string, user
  * Teacher-AI Collaboration Chat
  */
 export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: any, relatedLessons: string[]) => {
+  const ai = getAI();
   const response = await ai.models.generateContent({
     model: 'gemini-3-pro-preview',
     contents: `Teacher Question: ${teacherPrompt}\n\nTarget Lesson: ${JSON.stringify(currentLesson)}\n\nOther lessons in track: ${relatedLessons.join(', ')}`,
@@ -99,10 +102,10 @@ export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: a
 };
 
 /**
- * Admin Audit Report for lesson content verification.
+ * Admin Audit Report
  */
-// Added missing getAdminAuditReport export to fix ManagementDashboard import error
 export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: string[]) => {
+  const ai = getAI();
   const response = await ai.models.generateContent({
     model: 'gemini-3-pro-preview',
     contents: `Lesson to Audit: ${JSON.stringify(lesson)}\n\nRelated Lessons: ${relatedLessonTitles.join(', ')}`,
@@ -117,6 +120,7 @@ export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: stri
  * Live Audio Session Setup
  */
 export const connectLiveTeacher = async (callbacks: any, userName: string, context: string) => {
+  const ai = getAI();
   return ai.live.connect({
     model: 'gemini-2.5-flash-native-audio-preview-12-2025',
     callbacks,
@@ -136,6 +140,7 @@ export const connectLiveTeacher = async (callbacks: any, userName: string, conte
 };
 
 export const generateLessonSuggestion = async (discipline: string, topic: string, previousLessons: string[]) => {
+  const ai = getAI();
   const response = await ai.models.generateContent({
     model: 'gemini-3-pro-preview',
     contents: `Discipline: ${discipline}. Topic: ${topic}. Context of existing lessons: ${previousLessons.join(', ')}. Create a new lesson structure.`,
