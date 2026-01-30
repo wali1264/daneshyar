@@ -2,14 +2,21 @@
 import { GoogleGenAI } from "@google/genai";
 
 /**
- * Advanced AI Proxy Engine & KeyPool Manager
- * Updated to strictly follow the user's naming convention for 500 keys.
- * Strategy:
- * 1. Base Key: VITE_GOOGLE_GENAI_TOKEN
- * 2. Sequential Keys: VITE_GOOGLE_GENAI_TOKEN_1 to VITE_GOOGLE_GENAI_TOKEN_500
+ * Advanced AI Proxy Engine with Intelligent KeyPool & Blacklist Management
+ * 
+ * Features:
+ * 1. Blacklist System: Temporarily skips keys that hit 429 (Quota Exceeded).
+ * 2. Auto-Retry Logic: Automatically tries next available keys without user interruption.
+ * 3. Detailed Logging: Tracks specific key failures in the Vercel/Server console.
+ * 4. VPN Independent: Operates entirely server-side.
  */
+
+// In-memory blacklist for the lifecycle of the serverless instance
+const blacklistedKeys = new Map<string, number>();
+const BLACKLIST_DURATION_MS = 1000 * 60 * 5; // 5 minutes blacklist
+
 export default async function handler(req: any, res: any) {
-  // 1. Precise CORS Configuration for cross-origin requests
+  // 1. CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -17,64 +24,96 @@ export default async function handler(req: any, res: any) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
-  // 2. Dynamic Key Discovery (The 500 Keys Strategy - Strict Naming)
-  const keyPool: string[] = [];
+  // 2. Build the Key Pool
+  const keyPool: { name: string; value: string }[] = [];
   
-  // First/Main Key (No number)
   if (process.env.VITE_GOOGLE_GENAI_TOKEN) {
-    keyPool.push(process.env.VITE_GOOGLE_GENAI_TOKEN);
+    keyPool.push({ name: 'VITE_GOOGLE_GENAI_TOKEN', value: process.env.VITE_GOOGLE_GENAI_TOKEN });
   }
 
-  // Sequential Keys (1 to 500)
   for (let i = 1; i <= 500; i++) {
-    const dynamicKey = process.env[`VITE_GOOGLE_GENAI_TOKEN_${i}`];
-    if (dynamicKey) {
-      keyPool.push(dynamicKey);
+    const keyVal = process.env[`VITE_GOOGLE_GENAI_TOKEN_${i}`];
+    if (keyVal) {
+      keyPool.push({ name: `VITE_GOOGLE_GENAI_TOKEN_${i}`, value: keyVal });
     }
   }
 
-  // Safety check: ensure at least one key is available
   if (keyPool.length === 0) {
-    console.error('[System Error] KeyPool is empty. Please check Vercel Environment Variables.');
-    return res.status(500).json({ 
-      error: 'System Error: No valid API keys found. Expected VITE_GOOGLE_GENAI_TOKEN or VITE_GOOGLE_GENAI_TOKEN_1-500.' 
-    });
+    return res.status(500).json({ error: 'System Error: No keys found in Environment Variables.' });
   }
 
-  // 3. Selection Strategy: Random Rotation
-  // Distributes load evenly across all 500+ potential keys
-  const selectedIndex = Math.floor(Math.random() * keyPool.length);
-  const selectedKey = keyPool[selectedIndex];
-  
   const { action, model, contents, config } = req.body;
+  const maxRetries = Math.min(keyPool.length, 10); // Try up to 10 different keys if needed
+  let attempts = 0;
+  let lastError: any = null;
 
-  try {
-    // We create a fresh instance per request to ensure the latest key from the pool is used
-    const ai = new GoogleGenAI({ apiKey: selectedKey });
+  // 3. Execution Loop with Auto-Retry
+  while (attempts < maxRetries) {
+    attempts++;
 
-    if (action === 'generateContent') {
-      const result = await ai.models.generateContent({
-        model: model || 'gemini-3-flash-preview',
-        contents: contents,
-        config: config
-      });
+    // Filter out blacklisted keys
+    const now = Date.now();
+    const availableKeys = keyPool.filter(k => {
+      const blacklistedUntil = blacklistedKeys.get(k.name);
+      if (blacklistedUntil && now < blacklistedUntil) return false;
+      if (blacklistedUntil && now >= blacklistedUntil) {
+        blacklistedKeys.delete(k.name); // Clear expired blacklist
+        console.log(`[RECOVERY] Key ${k.name} has been restored to the active pool.`);
+      }
+      return true;
+    });
 
-      // Return the full result to the client
-      return res.status(200).json(result);
+    // If all keys are blacklisted, reset the list to avoid total outage
+    let currentPool = availableKeys.length > 0 ? availableKeys : keyPool;
+    if (availableKeys.length === 0) {
+      console.warn(`[WARNING] All keys were blacklisted. Resetting pool to prevent total failure.`);
+      blacklistedKeys.clear();
     }
 
-    return res.status(400).json({ error: `Action '${action}' is not supported by the Secure Proxy Bridge.` });
+    const selectedKeyObj = currentPool[Math.floor(Math.random() * currentPool.length)];
+    
+    try {
+      const ai = new GoogleGenAI({ apiKey: selectedKeyObj.value });
 
-  } catch (error: any) {
-    console.error(`[AI Proxy Failure] KeyIndex: ${selectedIndex} | Error:`, error.message);
-    
-    const status = error.status || 500;
-    const message = error.message || 'The AI Engine encountered an unexpected error.';
-    
-    return res.status(status).json({ 
-      error: message,
-      retrySuggested: status === 429,
-      info: `Error occurred using key pool member ${selectedIndex}`
-    });
+      if (action === 'generateContent') {
+        const result = await ai.models.generateContent({
+          model: model || 'gemini-3-flash-preview',
+          contents: contents,
+          config: config
+        });
+
+        // SUCCESS
+        if (attempts > 1) {
+          console.log(`[SUCCESS] Request completed on attempt #${attempts} using key: ${selectedKeyObj.name}`);
+        }
+        return res.status(200).json(result);
+      }
+
+      return res.status(400).json({ error: `Action '${action}' not supported.` });
+
+    } catch (error: any) {
+      lastError = error;
+      const statusCode = error.status || 500;
+
+      // Handle Quota Exhaustion (429)
+      if (statusCode === 429) {
+        console.error(`[QUOTA EXCEEDED] Key ${selectedKeyObj.name} (Pool Index: ${keyPool.indexOf(selectedKeyObj)}) reached daily limit. Blacklisting for 5 mins...`);
+        blacklistedKeys.set(selectedKeyObj.name, Date.now() + BLACKLIST_DURATION_MS);
+        
+        // Continue loop to try next key
+        continue;
+      }
+
+      // Handle other permanent errors
+      console.error(`[API ERROR] Key ${selectedKeyObj.name} failed with status ${statusCode}:`, error.message);
+      break; 
+    }
   }
+
+  // If we reach here, it means all attempts failed or a permanent error occurred
+  return res.status(lastError?.status || 500).json({ 
+    error: lastError?.message || 'Exhausted all retry attempts or encountered a fatal error.',
+    attempts: attempts,
+    retrySuggested: false
+  });
 }
