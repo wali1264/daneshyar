@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { getAITeacherResponse, connectLiveTeacher, decodeBase64, encodeBase64, decodeAudioData, generateLessonSpeech } from '../../services/gemini';
+import { getAITeacherResponse, connectLiveTeacher, decodeBase64, encodeBase64, decodeAudioData, generateLessonSpeech, getAIVoiceBridgeResponse } from '../../services/gemini';
 import Button from '../ui/Button';
 
 interface SenseiHubProps {
@@ -12,7 +12,8 @@ interface SenseiHubProps {
 
 enum HubMode {
   CHAT = 'CHAT',
-  VOICE = 'VOICE'
+  VOICE = 'VOICE',
+  BRIDGE = 'BRIDGE'
 }
 
 type STTStatus = 'idle' | 'recording' | 'processing' | 'error';
@@ -50,15 +51,14 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
   const [loadingChat, setLoadingChat] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
   
-  // STT State
+  // STT & Voice
   const [sttStatus, setSttStatus] = useState<STTStatus>('idle');
-  
-  // Voice State
   const [isVoiceActive, setIsVoiceActive] = useState(false);
   const [isVoiceConnecting, setIsVoiceConnecting] = useState(false);
   const [voiceTranscription, setVoiceTranscription] = useState('');
   const [volume, setVolume] = useState(0);
   
+  // Refs
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
@@ -67,6 +67,11 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const recognitionRef = useRef<any>(null);
   const silenceTimeoutRef = useRef<number | null>(null);
+  
+  // Socket Guard & Bridge Refs
+  const isSocketOpen = useRef(false);
+  const audioBufferRef = useRef<Int16Array[]>([]);
+  const bridgeProcessing = useRef(false);
 
   useEffect(() => {
     scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
@@ -74,9 +79,7 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
 
   useEffect(() => {
     if (isOpen) {
-      if (mode === HubMode.VOICE && !isVoiceActive) {
-        startVoiceSession();
-      }
+      if (mode === HubMode.VOICE && !isVoiceActive) startVoiceSession();
     } else {
       stopVoiceSession();
     }
@@ -85,67 +88,40 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
   const handleChatSend = async (text?: string) => {
     const msgText = text || chatInput;
     if (!msgText.trim()) return;
-
     setChatMessages(prev => [...prev, { role: 'user', text: msgText }]);
     setChatInput('');
     setLoadingChat(true);
-
     try {
       const response = await getAITeacherResponse(msgText, context, userName);
-      const cleanResponse = response.replace(/<hl>|<\/hl>/g, '');
-      setChatMessages(prev => [...prev, { role: 'ai', text: cleanResponse }]);
-      
-      // DEPRECATED: Auto-TTS for Chat removed as per user request
+      setChatMessages(prev => [...prev, { role: 'ai', text: response.replace(/<hl>|<\/hl>/g, '') }]);
     } catch (e) {
-      console.error(e);
-      setChatMessages(prev => [...prev, { role: 'ai', text: "متأسفانه در حال حاضر مشکلی در ارتباط با سرور وجود دارد. لطفاً دوباره تلاش کنید." }]);
-    } finally {
-      setLoadingChat(false);
-    }
+      setChatMessages(prev => [...prev, { role: 'ai', text: "خطایی در ارتباط با سرور رخ داد. چت متنی همچنان از پروکسی عبور می‌کند." }]);
+    } finally { setLoadingChat(false); }
   };
 
   const startSTT = () => {
     const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
     if (!SpeechRecognition) return;
-
     if (sttStatus === 'recording') {
       if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
       recognitionRef.current?.stop();
       return;
     }
-
     const recognition = new SpeechRecognition();
     recognition.lang = 'fa-IR';
     recognition.interimResults = true;
-    recognition.continuous = true; // Key for patience
+    recognition.continuous = true; 
     recognitionRef.current = recognition;
-
     const resetSilenceTimer = () => {
       if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
-      silenceTimeoutRef.current = window.setTimeout(() => {
-        if (recognitionRef.current) recognitionRef.current.stop();
-      }, 3000); // 3 seconds patience before stopping
+      silenceTimeoutRef.current = window.setTimeout(() => recognitionRef.current?.stop(), 4000);
     };
-
-    recognition.onstart = () => {
-      setSttStatus('recording');
-      resetSilenceTimer();
-    };
-    
+    recognition.onstart = () => { setSttStatus('recording'); resetSilenceTimer(); };
     recognition.onresult = (event: any) => {
       resetSilenceTimer();
-      const transcript = Array.from(event.results)
-        .map((result: any) => result[0].transcript)
-        .join('');
-      setChatInput(transcript);
+      setChatInput(Array.from(event.results).map((r: any) => r[0].transcript).join(''));
     };
-    
-    recognition.onerror = () => setSttStatus('error');
-    recognition.onend = () => {
-      setSttStatus('idle');
-      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
-    };
-    
+    recognition.onend = () => { setSttStatus('idle'); if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current); };
     recognition.start();
   };
 
@@ -154,45 +130,41 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
       setIsVoiceConnecting(true);
       setVoiceTranscription('');
       setLiveError(null);
+      isSocketOpen.current = false;
     }
-    
     try {
       const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       inputAudioContextRef.current = inputCtx;
       outputAudioContextRef.current = outputCtx;
-
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       
       const sessionPromise = connectLiveTeacher({
         onopen: () => {
           setIsVoiceConnecting(false);
           setIsVoiceActive(true);
+          isSocketOpen.current = true;
           setLiveError(null);
           const source = inputCtx.createMediaStreamSource(stream);
           const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
           scriptProcessor.onaudioprocess = (e) => {
+            if (!isSocketOpen.current) return;
             const inputData = e.inputBuffer.getChannelData(0);
-            const l = inputData.length;
-            const int16 = new Int16Array(l);
+            const int16 = new Int16Array(inputData.length);
             let sum = 0;
-            for (let i = 0; i < l; i++) {
+            for (let i = 0; i < inputData.length; i++) {
               int16[i] = inputData[i] * 32768;
               sum += Math.abs(inputData[i]);
             }
             const pcmBase64 = encodeBase64(new Uint8Array(int16.buffer));
-            sessionPromise.then(session => {
-              session.sendRealtimeInput({ media: { data: pcmBase64, mimeType: 'audio/pcm;rate=16000' } });
-            }).catch(() => {});
-            setVolume(Math.min(100, (sum / l) * 500));
+            sessionPromise.then(s => { if (isSocketOpen.current) s.sendRealtimeInput({ media: { data: pcmBase64, mimeType: 'audio/pcm;rate=16000' } }); }).catch(() => {});
+            setVolume(Math.min(100, (sum / inputData.length) * 500));
           };
           source.connect(scriptProcessor);
           scriptProcessor.connect(inputCtx.destination);
         },
         onmessage: async (message: any) => {
-          if (message.serverContent?.outputTranscription) {
-            setVoiceTranscription(prev => prev + message.serverContent.outputTranscription.text);
-          }
+          if (message.serverContent?.outputTranscription) setVoiceTranscription(prev => prev + message.serverContent.outputTranscription.text);
           const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
           if (audioData && outputAudioContextRef.current) {
             const ctx = outputAudioContextRef.current;
@@ -208,86 +180,140 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
           }
         },
         onclose: (e: CloseEvent) => {
-          console.warn(`Live Session Closed (Code: ${e.code}, Reason: ${e.reason})`);
-          // Close codes like 1011 (Internal Error) or 429 logic in proxy often result in unexpected close
-          if ((e.code === 1011 || e.code === 4000) && attempt < 3) {
-            console.log(`[Proxy Recovery] Quota limit likely hit. Attempting reconnect #${attempt + 1}...`);
-            setLiveError(`در حال بازنشانی فرکانس (تلاش ${attempt + 1})...`);
-            setTimeout(() => startVoiceSession(attempt + 1), 1000);
-          } else if (!isVoiceActive && !isVoiceConnecting) {
-             // Just a normal close
-          } else if (e.code !== 1000 && e.code !== 1005) {
-            setLiveError("اتصال زنده قطع شد. لطفاً دوباره تلاش کنید.");
-            setTimeout(() => handleEndVoiceAction(), 3000);
+          isSocketOpen.current = false;
+          if (e.code === 1011 || e.code === 1006 || e.code === 429) {
+            if (attempt < 3) {
+              setLiveError(`محدودیت WSS شناسایی شد. تلاش مجدد... (${attempt})`);
+              setTimeout(() => startVoiceSession(attempt + 1), 1000);
+            } else {
+              setLiveError("سوییچ به پل صوتی HTTP (بدون نیاز به VPN)... ⚡");
+              setTimeout(() => startVoiceBridge(), 2000);
+            }
           }
         },
-        onerror: (e: any) => {
-          console.error("Live Session Error:", e);
-          if (attempt < 3) {
-            setTimeout(() => startVoiceSession(attempt + 1), 1000);
-          } else {
-            setLiveError("خطا در اتصال به موتور زنده. در حال سوییچ به وضعیت چت متنی-صوتی...");
-            setTimeout(() => handleEndVoiceAction(), 3000);
-          }
-        }
+        onerror: () => { isSocketOpen.current = false; }
       }, userName, context);
-
       sessionRef.current = await sessionPromise;
-      
-      // Safety timeout for initial connection
-      setTimeout(() => {
-        if (isVoiceConnecting && !isVoiceActive && attempt >= 3) {
-          setLiveError("زمان انتظار تمام شد. استفاده از چت متنی پیشنهاد می‌شود.");
-          setTimeout(() => handleEndVoiceAction(), 4000);
-        }
-      }, 15000);
-
-    } catch (err: any) {
-      console.error("Voice initialization failed:", err);
-      if (attempt < 3) {
-        startVoiceSession(attempt + 1);
-      } else {
-        setIsVoiceConnecting(false);
-        setLiveError("امکان دسترسی به میکروفون یا سرور زنده وجود ندارد.");
-        setTimeout(() => setMode(HubMode.CHAT), 4000);
-      }
+    } catch (err) {
+      isSocketOpen.current = false;
+      if (attempt < 3) startVoiceSession(attempt + 1); else startVoiceBridge();
     }
   };
 
-  const handleEndVoiceAction = () => {
+  const startVoiceBridge = async () => {
     stopVoiceSession();
-    setMode(HubMode.CHAT);
+    setMode(HubMode.BRIDGE);
+    setIsVoiceActive(true);
+    setIsVoiceConnecting(false);
+    setLiveError(null);
+    setVoiceTranscription("پل صوتی دانش‌یار فعال شد (بدون VPN)");
+
+    const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'fa-IR';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognitionRef.current = recognition;
+
+    const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+    inputAudioContextRef.current = inputCtx;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const source = inputCtx.createMediaStreamSource(stream);
+    const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
+    
+    scriptProcessor.onaudioprocess = (e) => {
+      if (bridgeProcessing.current) return;
+      const inputData = e.inputBuffer.getChannelData(0);
+      const int16 = new Int16Array(inputData.length);
+      let sum = 0;
+      for (let i = 0; i < inputData.length; i++) {
+        int16[i] = inputData[i] * 32768;
+        sum += Math.abs(inputData[i]);
+      }
+      audioBufferRef.current.push(int16);
+      setVolume(Math.min(100, (sum / inputData.length) * 500));
+    };
+
+    source.connect(scriptProcessor);
+    scriptProcessor.connect(inputCtx.destination);
+
+    recognition.onresult = (event: any) => {
+      const transcript = Array.from(event.results).map((r: any) => r[0].transcript).join('');
+      setVoiceTranscription(transcript);
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+      silenceTimeoutRef.current = window.setTimeout(async () => {
+        if (audioBufferRef.current.length > 0) {
+          recognition.stop();
+          await processBridgeBuffer();
+          recognition.start();
+        }
+      }, 3500); // 3.5s patience
+    };
+
+    recognition.start();
+  };
+
+  const processBridgeBuffer = async () => {
+    if (bridgeProcessing.current) return;
+    bridgeProcessing.current = true;
+    setLiveError("در حال ارسال پکت صوتی...");
+    
+    const totalLength = audioBufferRef.current.reduce((acc, b) => acc + b.length, 0);
+    const merged = new Int16Array(totalLength);
+    let offset = 0;
+    for (const b of audioBufferRef.current) { merged.set(b, offset); offset += b.length; }
+    audioBufferRef.current = [];
+    
+    const base64 = encodeBase64(new Uint8Array(merged.buffer));
+    try {
+      const responseAudio = await getAIVoiceBridgeResponse(base64, context, userName);
+      setLiveError(null);
+      if (responseAudio && isOpen) {
+        if (!outputAudioContextRef.current) outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+        const buffer = await decodeAudioData(decodeBase64(responseAudio), outputAudioContextRef.current, 24000, 1);
+        const source = outputAudioContextRef.current.createBufferSource();
+        source.buffer = buffer;
+        source.connect(outputAudioContextRef.current.destination);
+        source.start();
+        sourcesRef.current.add(source);
+        source.onended = () => { sourcesRef.current.delete(source); bridgeProcessing.current = false; };
+      } else { bridgeProcessing.current = false; }
+    } catch (e) {
+      setLiveError("خطای موقت در پل. در حال بازیابی...");
+      bridgeProcessing.current = false;
+    }
   };
 
   const stopVoiceSession = () => {
+    isSocketOpen.current = false;
+    bridgeProcessing.current = false;
+    if (recognitionRef.current) { try { recognitionRef.current.stop(); } catch(e) {} recognitionRef.current = null; }
     if (sessionRef.current) { try { sessionRef.current.close(); } catch(e) {} sessionRef.current = null; }
     if (inputAudioContextRef.current) { try { inputAudioContextRef.current.close(); } catch(e) {} inputAudioContextRef.current = null; }
     if (outputAudioContextRef.current) { try { outputAudioContextRef.current.close(); } catch(e) {} outputAudioContextRef.current = null; }
-    setIsVoiceActive(false);
-    setIsVoiceConnecting(false);
-    setVolume(0);
-    nextStartTimeRef.current = 0;
-    sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
-    sourcesRef.current.clear();
+    setIsVoiceActive(false); setIsVoiceConnecting(false); setVolume(0); nextStartTimeRef.current = 0;
+    sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} }); sourcesRef.current.clear();
+    audioBufferRef.current = [];
   };
+
+  const handleEndVoiceAction = () => { stopVoiceSession(); setMode(HubMode.CHAT); };
 
   if (!isOpen) return null;
 
   return (
     <div className="fixed inset-y-0 left-0 w-full md:w-[450px] bg-white shadow-[-20px_0_50px_rgba(0,0,0,0.1)] z-[100] border-r border-slate-100 flex flex-col animate-slide-in-right font-['Vazirmatn']">
-      
       <header className="bg-slate-900 px-8 py-10 text-white relative overflow-hidden">
         <div className="absolute top-0 right-0 w-40 h-40 bg-blue-600/10 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2"></div>
         <div className="relative z-10 flex items-center justify-between">
           <div className="flex items-center gap-4">
-             <div className="w-14 h-14 bg-blue-600 rounded-[1.5rem] flex items-center justify-center shadow-xl border border-white/10 transform rotate-3">
-               <TeacherIcon />
-             </div>
+             <div className="w-14 h-14 bg-blue-600 rounded-[1.5rem] flex items-center justify-center shadow-xl border border-white/10 transform rotate-3"><TeacherIcon /></div>
              <div>
                <h2 className="text-2xl font-black tracking-tight leading-none">استاد همراه دانش‌یار</h2>
                <div className="flex items-center gap-1 mt-2">
                  <div className={`w-2 h-2 rounded-full ${isVoiceActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}></div>
-                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{isVoiceActive ? 'LIVE ACTIVE' : 'TEXT MODE'}</span>
+                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+                   {mode === HubMode.BRIDGE ? 'BRIDGE ENABLED' : (isVoiceActive ? 'LIVE ACTIVE' : 'TEXT MODE')}
+                 </span>
                </div>
              </div>
           </div>
@@ -296,12 +322,8 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
       </header>
 
       <div className="flex p-2 bg-slate-50/50 backdrop-blur-sm border-b border-slate-100">
-        <button onClick={() => setMode(HubMode.CHAT)} className={`flex-1 py-4 rounded-2xl font-black text-[12px] transition-all flex items-center justify-center gap-2 ${mode === HubMode.CHAT ? 'bg-white text-blue-600 shadow-xl scale-[1.02] border border-slate-200' : 'text-slate-400 hover:text-slate-600'}`}>
-          <span>💬</span> چت متنی
-        </button>
-        <button onClick={() => setMode(HubMode.VOICE)} className={`flex-1 py-4 rounded-2xl font-black text-[12px] transition-all flex items-center justify-center gap-2 ${mode === HubMode.VOICE ? 'bg-white text-blue-600 shadow-xl scale-[1.02] border border-slate-200' : 'text-slate-400 hover:text-slate-600'}`}>
-          <span>🎙️</span> تعامل زنده (WSS)
-        </button>
+        <button onClick={() => setMode(HubMode.CHAT)} className={`flex-1 py-4 rounded-2xl font-black text-[12px] transition-all flex items-center justify-center gap-2 ${mode === HubMode.CHAT ? 'bg-white text-blue-600 shadow-xl scale-[1.02] border border-slate-200' : 'text-slate-400 hover:text-slate-600'}`}><span>💬</span> چت متنی</button>
+        <button onClick={() => setMode(HubMode.VOICE)} className={`flex-1 py-4 rounded-2xl font-black text-[12px] transition-all flex items-center justify-center gap-2 ${mode !== HubMode.CHAT ? 'bg-white text-blue-600 shadow-xl scale-[1.02] border border-slate-200' : 'text-slate-400 hover:text-slate-600'}`}><span>🎙️</span> تعامل زنده</button>
       </div>
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-4 bg-slate-50/20 custom-scrollbar relative">
@@ -309,9 +331,7 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
           <>
             {chatMessages.map((m, i) => (
               <div key={i} className={`flex ${m.role === 'user' ? 'justify-start text-right' : 'justify-end text-right'}`}>
-                <div className={`max-w-[85%] p-4 rounded-[1.8rem] text-xs font-bold leading-loose shadow-sm transition-all duration-300 ${m.role === 'user' ? 'bg-blue-600 text-white rounded-br-none' : 'bg-white text-slate-800 rounded-bl-none border border-slate-100'}`}>
-                  {m.text}
-                </div>
+                <div className={`max-w-[85%] p-4 rounded-[1.8rem] text-xs font-bold leading-loose shadow-sm transition-all duration-300 ${m.role === 'user' ? 'bg-blue-600 text-white rounded-br-none' : 'bg-white text-slate-800 rounded-bl-none border border-slate-100'}`}>{m.text}</div>
               </div>
             ))}
             {loadingChat && <div className="flex justify-end"><div className="bg-white p-3 rounded-2xl animate-pulse text-[10px] font-black text-slate-400 border border-slate-100 shadow-sm">در حال بررسی کدهای شما...</div></div>}
@@ -319,36 +339,23 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
         ) : (
           <div className="h-full flex flex-col items-center justify-center text-center space-y-12 animate-fade-in">
              <div className="relative group">
-               <div className={`w-40 h-40 rounded-[3rem] flex items-center justify-center text-6xl transition-all duration-500 shadow-2xl rotate-3 group-hover:rotate-0 ${isVoiceActive ? 'bg-blue-600 shadow-[0_0_80px_rgba(37,99,235,0.4)]' : 'bg-slate-200 text-slate-400'}`}>
-                 <TeacherIcon />
-               </div>
+               <div className={`w-40 h-40 rounded-[3rem] flex items-center justify-center text-6xl transition-all duration-500 shadow-2xl rotate-3 group-hover:rotate-0 ${isVoiceActive ? 'bg-blue-600 shadow-[0_0_80px_rgba(37,99,235,0.4)]' : 'bg-slate-200 text-slate-400'}`}><TeacherIcon /></div>
                {isVoiceActive && <div className="absolute inset-0 rounded-[3.5rem] border-2 border-blue-400 animate-ping opacity-25" style={{ transform: `scale(${1 + volume/200})` }}></div>}
              </div>
-
              <div className="space-y-3 px-6">
                <h3 className="text-2xl font-black text-slate-800 tracking-tight">
-                 {isVoiceConnecting ? 'در حال عبور از محدودیت‌های شبکه...' : isVoiceActive ? `در حال گفتگو با ${userName}` : 'در انتظار اتصال...'}
+                 {isVoiceConnecting ? 'در حال برقراری اتصال امن...' : (mode === HubMode.BRIDGE ? 'پل صوتی فعال شد' : `در حال گفتگو با ${userName}`)}
                </h3>
                <p className={`text-[11px] font-black uppercase tracking-[0.3em] ${liveError ? 'text-rose-500' : 'text-blue-500 opacity-80'}`}>
-                 {liveError ? 'SECURITY_PROTOCOL_BLOCKED' : (isVoiceActive ? 'BYPASSING_RESTRICTIONS_ACTIVE' : 'INITIALIZING_SECURE_TUNNEL')}
+                 {liveError || (mode === HubMode.BRIDGE ? 'HTTP_VOICE_BRIDGE_ACTIVE' : 'SECURE_CHANNEL_READY')}
                </p>
              </div>
-
-             {liveError && (
-               <div className="bg-rose-50 text-rose-600 p-6 rounded-3xl border border-rose-100 text-[10px] font-black leading-loose animate-bounce mx-6">
-                 {liveError}
-               </div>
-             )}
-
              {isVoiceActive && (
                <div className="w-full bg-white/80 backdrop-blur-md border border-slate-200/50 p-8 rounded-[3rem] text-right min-h-[160px] shadow-xl overflow-y-auto max-h-[250px] animate-slide-in-up">
-                 <p className="text-xs font-bold text-slate-500 leading-loose italic opacity-90">
-                   {voiceTranscription || 'مربی در حال گوش دادن است...'}
-                 </p>
+                 <p className="text-xs font-bold text-slate-500 leading-loose italic opacity-90">{voiceTranscription || 'استاد در حال گوش دادن است...'}</p>
                </div>
              )}
-
-             <Button onClick={handleEndVoiceAction} variant="danger" className="w-full h-18 rounded-[2.2rem] text-sm font-black shadow-2xl hover:scale-105 active:scale-95 transition-all">قطع اتصال و بازگشت 🛑</Button>
+             <Button onClick={handleEndVoiceAction} variant="danger" className="w-full h-18 rounded-[2.2rem] text-sm font-black shadow-2xl hover:scale-105 active:scale-95 transition-all">قطع اتصال صوتی 🛑</Button>
           </div>
         )}
       </div>
@@ -358,20 +365,10 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
           <div className="relative group">
             <div className={`flex items-center bg-slate-50 border-2 transition-all duration-300 rounded-[2.5rem] px-5 py-2 shadow-sm ${sttStatus === 'recording' ? 'border-blue-400 bg-blue-50/30' : 'border-slate-100 group-focus-within:border-blue-500 group-focus-within:bg-white'}`}>
               <button className="w-10 h-10 flex items-center justify-center rounded-full text-slate-400 hover:text-slate-600 transition-colors"><span className="text-2xl font-light">+</span></button>
-              <input 
-                className="flex-1 bg-transparent px-3 py-3 outline-none text-xs font-bold text-slate-800 placeholder-slate-400"
-                placeholder={sttStatus === 'recording' ? "در حال شنیدن..." : "سوالی دارید؟ بپرسید..."}
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleChatSend()}
-              />
+              <input className="flex-1 bg-transparent px-3 py-3 outline-none text-xs font-bold text-slate-800 placeholder-slate-400" placeholder={sttStatus === 'recording' ? "استاد می‌شنود..." : "سوالی دارید؟"} value={chatInput} onChange={(e) => setChatInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleChatSend()} />
               <div className="flex items-center gap-2">
                 {sttStatus === 'recording' && <div className="flex gap-1 items-end h-4 px-2">{[1,2,3,4].map(i => <div key={i} className="w-0.5 bg-blue-500 rounded-full animate-wave" style={{ animationDelay: `${i*0.1}s` }}></div>)}</div>}
-                {chatInput.trim() ? (
-                   <button onClick={() => handleChatSend()} className="w-10 h-10 bg-slate-900 text-white rounded-full flex items-center justify-center hover:bg-blue-600 transition-all shadow-md animate-scale-up"><SendIcon /></button>
-                ) : (
-                   <button onClick={startSTT} className={`w-10 h-10 rounded-full flex items-center justify-center transition-all ${sttStatus === 'recording' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-900'}`}><MicrophoneIcon /></button>
-                )}
+                {chatInput.trim() ? <button onClick={() => handleChatSend()} className="w-10 h-10 bg-slate-900 text-white rounded-full flex items-center justify-center hover:bg-blue-600 transition-all shadow-md animate-scale-up"><SendIcon /></button> : <button onClick={startSTT} className={`w-10 h-10 rounded-full flex items-center justify-center transition-all ${sttStatus === 'recording' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-900'}`}><MicrophoneIcon /></button>}
               </div>
             </div>
           </div>

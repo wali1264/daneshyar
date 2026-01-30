@@ -15,9 +15,8 @@ async function callProxy(payload: any) {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Bridge failure');
 
-    // Advanced logging for debugging the 500-key pool
     if (data._proxyMetadata) {
-      console.log(`%c[Proxy Success] Key: ${data._proxyMetadata.keyName} | Attempts: ${data._proxyMetadata.attempts} | Healthy Keys in Pool: ${data._proxyMetadata.poolSize}`, "color: #10b981; font-weight: bold;");
+      console.log(`%c[Proxy Success] Key: ${data._proxyMetadata.keyName} | Healthy Keys: ${data._proxyMetadata.poolSize}`, "color: #10b981; font-weight: bold;");
     }
 
     return data;
@@ -65,7 +64,29 @@ export async function decodeAudioData(
   return buffer;
 }
 
-// Models switched to Flash as per instructions to prevent 429 errors
+/**
+ * Voice Bridge: Sends audio packets via HTTP proxy to bypass WSS filtering
+ */
+export const getAIVoiceBridgeResponse = async (audioBase64: string, context: string, userName: string) => {
+  const result = await callProxy({
+    action: 'generateContent',
+    model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+    contents: [{
+      parts: [
+        { inlineData: { data: audioBase64, mimeType: 'audio/pcm;rate=16000' } },
+        { text: `Respond as the AI mentor for ${userName}. Keep it concise and academic in Persian. Context: ${context}` }
+      ]
+    }],
+    config: {
+      responseModalities: [Modality.AUDIO],
+      speechConfig: {
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
+      },
+    },
+  });
+  return result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+};
+
 export const generateLessonSpeech = async (text: string) => {
   const result = await callProxy({
     action: 'generateContent',
@@ -140,14 +161,8 @@ export const getAdminAuditReport = async (lesson: any, related: string[]) => {
   return result.candidates?.[0]?.content?.parts?.[0]?.text || '';
 };
 
-/**
- * Dynamic Key Selection for Live API
- * Fetches a healthy key from the proxy pool before initiating WSS
- */
 export const connectLiveTeacher = async (callbacks: any, userName: string, context: string) => {
   const { GoogleGenAI } = await import("@google/genai");
-  
-  // 1. Fetch a fresh key from the pool via Proxy
   const keyResponse = await fetch('/api/proxy', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -155,8 +170,6 @@ export const connectLiveTeacher = async (callbacks: any, userName: string, conte
   });
   const { apiKey, keyName } = await keyResponse.json();
   
-  console.log(`%c[Live API] Initializing session with key: ${keyName}`, "color: #3b82f6; font-weight: bold;");
-
   const ai = new GoogleGenAI({ apiKey }); 
   return ai.live.connect({
     model: 'gemini-2.5-flash-native-audio-preview-12-2025',
