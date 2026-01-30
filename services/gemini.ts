@@ -2,39 +2,64 @@
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 
 /**
- * DaneshYar Edge Tunnel Interceptor
- * This logic intercepts all fetch calls to Google APIs and redirects them 
- * through our Vercel-hosted proxy to bypass regional restrictions (Iran/Afghanistan).
+ * DaneshYar Advanced Edge Tunnel Interceptor
+ * Intercepts all fetch/websocket calls to Google APIs to handle regional restrictions.
  */
 const GOOGLE_API_HOST = "generativelanguage.googleapis.com";
 const PROXY_PATH = "/api/google-proxy";
 
+// 1. Fetch Interceptor for REST APIs (Text, Audio, Images)
 const originalFetch = window.fetch;
 window.fetch = async (...args: any[]) => {
   const [resource, config] = args;
   let url = typeof resource === "string" ? resource : resource instanceof URL ? resource.href : (resource as any).url;
 
   if (url && url.includes(GOOGLE_API_HOST)) {
-    // Transparently rewrite the URL to use our Vercel Edge Proxy
     const newUrl = url.replace(`https://${GOOGLE_API_HOST}`, PROXY_PATH);
     
-    // Log for debugging during deployment
-    console.debug(`[EdgeTunnel] Routing through Vercel: ${newUrl}`);
+    // Ensure the key is also caught if it's in the query params
+    const updatedUrl = newUrl.includes('key=') ? newUrl : newUrl;
+
+    console.debug(`[EdgeTunnel] Routing HTTP request: ${updatedUrl}`);
     
-    if (typeof resource !== "string" && !(resource instanceof URL)) {
-      const newRequest = new Request(newUrl, resource as RequestInit);
-      return originalFetch(newRequest, config);
+    // Create a new request object to avoid sealed/used request errors
+    if (resource instanceof Request) {
+      const headers = new Headers(resource.headers);
+      const newRequest = new Request(updatedUrl, {
+        method: resource.method,
+        headers: headers,
+        body: resource.body,
+        referrer: resource.referrer,
+        mode: 'cors', // Force CORS to handle rewrite properly
+        credentials: resource.credentials,
+      });
+      return originalFetch(newRequest);
     }
-    return originalFetch(newUrl, config);
+    
+    return originalFetch(updatedUrl, config);
   }
 
   return originalFetch(resource, config);
 };
 
+// 2. WebSocket Guard (Live API)
+// Since Vercel rewrites don't support WSS, we flag failures for the app to handle fallback.
+const OriginalWebSocket = window.WebSocket;
+(window as any).WebSocket = function(url: string, protocols?: string | string[]) {
+  if (url.includes(GOOGLE_API_HOST)) {
+    console.warn(`[EdgeTunnel] WebSocket (WSS) call detected to restricted domain. 
+      Vercel Rewrites do not support WSS. Fallback to REST mode is recommended.`);
+    
+    // We add a custom property to the instance for the app to check
+    const ws = new OriginalWebSocket(url, protocols);
+    (ws as any).isGoogleLive = true;
+    return ws;
+  }
+  return new OriginalWebSocket(url, protocols);
+};
+
 /**
  * Smart Key Management System (KeyPool Engine)
- * Handles rate limits by rotating through available API keys.
- * Pattern: VITE_GOOGLE_GENAI_TOKEN, VITE_GOOGLE_GENAI_TOKEN_1, ..., VITE_GOOGLE_GENAI_TOKEN_500
  */
 class KeyManager {
   private keys: string[] = [];
@@ -51,50 +76,34 @@ class KeyManager {
     const viteEnv = (import.meta as any).env || {};
     const env = { ...viteEnv, ...processEnv };
     
-    const foundKeyNames: string[] = [];
     const pool: string[] = [];
 
-    if (env.API_KEY) {
-      pool.push(env.API_KEY);
-      foundKeyNames.push('API_KEY');
-    }
-
-    if (env.VITE_GOOGLE_GENAI_TOKEN) {
-      pool.push(env.VITE_GOOGLE_GENAI_TOKEN);
-      foundKeyNames.push('VITE_GOOGLE_GENAI_TOKEN');
-    }
+    if (env.API_KEY) pool.push(env.API_KEY);
+    if (env.VITE_GOOGLE_GENAI_TOKEN) pool.push(env.VITE_GOOGLE_GENAI_TOKEN);
 
     for (let i = 1; i <= 500; i++) {
       const keyName = `VITE_GOOGLE_GENAI_TOKEN_${i}`;
-      if (env[keyName]) {
-        pool.push(env[keyName]);
-        foundKeyNames.push(keyName);
-      }
+      if (env[keyName]) pool.push(env[keyName]);
     }
 
     this.keys = pool;
-    
     if (this.keys.length > 0) {
       console.log(`[KeyManager] 🛡️ Smart Guard Active! Found ${this.keys.length} keys.`);
     } else {
-      console.error(`[KeyManager] 🚨 CRITICAL ERROR: No API keys detected!`);
-      if (process.env.API_KEY) {
-          this.keys = [process.env.API_KEY];
-      }
+      console.error(`[KeyManager] 🚨 NO API KEYS FOUND! Using default fallback.`);
     }
   }
 
   public getNextHealthyKey(): string {
-    if (this.keys.length === 0) return process.env.API_KEY || '';
+    if (this.keys.length === 0) return (window as any).process?.env?.API_KEY || '';
     const now = Date.now();
     let attempts = 0;
     while (attempts < this.keys.length) {
       const key = this.keys[this.currentIndex];
       const cooldownUntil = this.cooldowns.get(key) || 0;
       if (now > cooldownUntil) {
-        const selectedKey = key;
         this.currentIndex = (this.currentIndex + 1) % this.keys.length;
-        return selectedKey;
+        return key;
       }
       this.currentIndex = (this.currentIndex + 1) % this.keys.length;
       attempts++;
@@ -127,7 +136,14 @@ async function executeWithRotation<T>(operation: (ai: GoogleGenAI) => Promise<T>
     } catch (err: any) {
       lastError = err;
       const errorMsg = err.message?.toLowerCase() || '';
+      console.error(`[KeyRotation] Attempt ${i+1} failed with key ${key.slice(0, 6)}... : ${errorMsg}`);
+      
       if (errorMsg.includes('429') || errorMsg.includes('quota') || errorMsg.includes('limit')) {
+        keyManager.markAsLimited(key);
+        continue;
+      }
+      if (errorMsg.includes('403') || errorMsg.includes('forbidden') || errorMsg.includes('permission denied')) {
+        // Most likely geoblocking despite proxy - mark this key and move on
         keyManager.markAsLimited(key);
         continue;
       }
