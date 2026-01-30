@@ -2,6 +2,10 @@
 {
   "rewrites": [
     {
+      "source": "/api/proxy",
+      "destination": "/api/proxy"
+    },
+    {
       "source": "/api/google-proxy/:path*",
       "destination": "https://generativelanguage.googleapis.com/:path*"
     }

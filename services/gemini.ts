@@ -1,95 +1,31 @@
 
-import { GoogleGenAI, Type, Modality } from "@google/genai";
+import { Type, Modality } from "@google/genai";
 
 /**
- * Smart Key Management System (KeyPool Engine)
- * Handles API key rotation and health checks without intercepting global fetch.
+ * Standard Proxy Caller
+ * Instead of direct SDK calls, we route everything through our serverless bridge.
+ * This avoids regional blocks and hides the API Key from the browser.
  */
-class KeyManager {
-  private keys: string[] = [];
-  private currentIndex: number = 0;
-  private cooldowns: Map<string, number> = new Map();
-  private readonly COOLDOWN_TIME = 65000;
+async function callProxy(payload: any) {
+  try {
+    const response = await fetch('/api/proxy', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
 
-  constructor() {
-    this.initPool();
-  }
-
-  private initPool() {
-    const processEnv = (typeof process !== 'undefined' && process.env) ? process.env : {};
-    const viteEnv = (import.meta as any).env || {};
-    const env = { ...viteEnv, ...processEnv };
-    
-    const pool: string[] = [];
-
-    if (env.API_KEY) pool.push(env.API_KEY);
-    if (env.VITE_GOOGLE_GENAI_TOKEN) pool.push(env.VITE_GOOGLE_GENAI_TOKEN);
-
-    for (let i = 1; i <= 500; i++) {
-      const keyName = `VITE_GOOGLE_GENAI_TOKEN_${i}`;
-      if (env[keyName]) pool.push(env[keyName]);
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error || 'Request failed');
     }
 
-    this.keys = pool;
-    if (this.keys.length > 0) {
-      console.log(`[KeyManager] 🛡️ Smart Guard Active! Found ${this.keys.length} keys.`);
-    } else {
-      console.warn(`[KeyManager] 🚨 NO API KEYS FOUND in environment!`);
-    }
+    return await response.json();
+  } catch (error: any) {
+    console.error('[GeminiService] Proxy Call Failed:', error.message);
+    throw error;
   }
-
-  public getNextHealthyKey(): string {
-    if (this.keys.length === 0) return (window as any).process?.env?.API_KEY || '';
-    const now = Date.now();
-    let attempts = 0;
-    while (attempts < this.keys.length) {
-      const key = this.keys[this.currentIndex];
-      const cooldownUntil = this.cooldowns.get(key) || 0;
-      if (now > cooldownUntil) {
-        this.currentIndex = (this.currentIndex + 1) % this.keys.length;
-        return key;
-      }
-      this.currentIndex = (this.currentIndex + 1) % this.keys.length;
-      attempts++;
-    }
-    return this.keys[0];
-  }
-
-  public markAsLimited(key: string) {
-    this.cooldowns.set(key, Date.now() + this.COOLDOWN_TIME);
-  }
-
-  public getKeyCount() {
-    return this.keys.length;
-  }
-}
-
-const keyManager = new KeyManager();
-
-async function executeWithRotation<T>(operation: (ai: GoogleGenAI) => Promise<T>): Promise<T> {
-  let lastError: any;
-  const maxRetries = Math.max(3, keyManager.getKeyCount());
-
-  for (let i = 0; i < maxRetries; i++) {
-    const key = keyManager.getNextHealthyKey();
-    if (!key) throw new Error("API key is missing.");
-    const ai = new GoogleGenAI({ apiKey: key });
-
-    try {
-      return await operation(ai);
-    } catch (err: any) {
-      lastError = err;
-      const errorMsg = err.message?.toLowerCase() || '';
-      console.error(`[KeyRotation] Attempt ${i+1} failed: ${errorMsg}`);
-      
-      if (errorMsg.includes('429') || errorMsg.includes('quota') || errorMsg.includes('limit')) {
-        keyManager.markAsLimited(key);
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw lastError;
 }
 
 export function decodeBase64(base64: string) {
@@ -130,38 +66,93 @@ export async function decodeAudioData(
   return buffer;
 }
 
+/**
+ * Optimized API Methods using the Proxy Bridge
+ */
+
 export const generateLessonSpeech = async (text: string) => {
-  return executeWithRotation(async (ai) => {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: `خوانش آموزشی متن: ${text}` }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
-        },
+  const result = await callProxy({
+    action: 'generateContent',
+    model: 'gemini-2.5-flash-preview-tts',
+    contents: [{ parts: [{ text: `خوانش آموزشی متن با لحن حرفه‌ای: ${text}` }] }],
+    config: {
+      responseModalities: [Modality.AUDIO],
+      speechConfig: {
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
       },
-    });
-    return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    },
   });
+  return result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
 };
 
 export const getAITeacherResponse = async (prompt: string, context: string, userName: string) => {
-  return executeWithRotation(async (ai) => {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: `Context: ${context}\n\nUser: ${prompt}`,
-      config: {
-        systemInstruction: `تو مربی برنامه‌نویسی "${userName}" هستی. پاسخ‌ها کوتاه و به فارسی باشد. کدهای مهم را در <hl>...</hl> قرار بده.`,
-      },
-    });
-    return response.text || '';
+  const result = await callProxy({
+    action: 'generateContent',
+    model: 'gemini-3-pro-preview',
+    contents: [{ parts: [{ text: `Context: ${context}\n\nUser Question: ${prompt}` }] }],
+    config: {
+      systemInstruction: `تو مربی برنامه‌نویسی "${userName}" هستی. پاسخ‌ها به زبان فارسی، کوتاه، دوستانه و علمی باشد. کدهای مهم را در تگ <hl> قرار بده.`,
+    },
   });
+  return result.text || '';
 };
 
+export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: any, relatedTitles: string[]) => {
+  const result = await callProxy({
+    action: 'generateContent',
+    model: 'gemini-3-pro-preview',
+    contents: [{ parts: [{ text: `Teacher Prompt: ${teacherPrompt}\nLesson Data: ${JSON.stringify(currentLesson)}\nRelated Lessons: ${relatedTitles.join(', ')}` }] }],
+    config: {
+      systemInstruction: "You are a Senior Academic Peer for Teachers. Help refine the curriculum and offer pedagogical advice in Persian.",
+    }
+  });
+  return result.text || '';
+};
+
+export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: string[]) => {
+  const result = await callProxy({
+    action: 'generateContent',
+    model: 'gemini-3-pro-preview',
+    contents: [{ parts: [{ text: `Lesson to Audit: ${JSON.stringify(lesson)}\nContext Titles: ${relatedLessonTitles.join(', ')}` }] }],
+    config: {
+      systemInstruction: "You are a Senior Academic Auditor. Analyze the lesson for accuracy, clarity, and relevance. Provide the report in Persian.",
+    }
+  });
+  return result.text || '';
+};
+
+export const generateLessonSuggestion = async (discipline: string, topic: string, previousLessons: string[]) => {
+  const result = await callProxy({
+    action: 'generateContent',
+    model: 'gemini-3-pro-preview',
+    contents: [{ parts: [{ text: `Discipline: ${discipline}. Topic: ${topic}. Existing lessons: ${previousLessons.join(', ')}` }] }],
+    config: {
+      systemInstruction: "You are an expert curriculum designer. Generate a new lesson structure. Output in JSON format.",
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          content: { type: Type.STRING },
+          explanation: { type: Type.STRING },
+        },
+        required: ["title", "content", "explanation"]
+      }
+    }
+  });
+  return JSON.parse(result.text || '{}');
+};
+
+/**
+ * Note: connectLiveTeacher (WSS) still uses direct connection. 
+ * Proxying WSS requires a stateful WebSocket proxy which standard serverless functions don't support.
+ * We rely on the client's direct connection for WSS if available.
+ */
 export const connectLiveTeacher = async (callbacks: any, userName: string, context: string) => {
-  const key = keyManager.getNextHealthyKey();
-  const ai = new GoogleGenAI({ apiKey: key });
+  // Use a temporary key for the handshake (will be replaced by env key on client if available)
+  const key = (window as any).process?.env?.API_KEY || '';
+  const { GoogleGenAI: GenAI } = await import("@google/genai");
+  const ai = new GenAI({ apiKey: key });
   return ai.live.connect({
     model: 'gemini-2.5-flash-native-audio-preview-12-2025',
     callbacks,
@@ -172,54 +163,5 @@ export const connectLiveTeacher = async (callbacks: any, userName: string, conte
       },
       systemInstruction: `تو مربی زنده "${userName}" هستی. کانتکست: ${context}`,
     }
-  });
-};
-
-export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: any, relatedLessons: string[]) => {
-  return executeWithRotation(async (ai) => {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: `Teacher Question: ${teacherPrompt}\nTarget Lesson: ${JSON.stringify(currentLesson)}`,
-      config: {
-        systemInstruction: "You are a Senior Academic Peer AI for Teachers. Speak Persian.",
-      }
-    });
-    return response.text || '';
-  });
-};
-
-export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: string[]) => {
-  return executeWithRotation(async (ai) => {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: `Lesson to Audit: ${JSON.stringify(lesson)}`,
-      config: {
-        systemInstruction: "You are a Senior Academic Auditor. Speak Persian.",
-      },
-    });
-    return response.text || '';
-  });
-};
-
-export const generateLessonSuggestion = async (discipline: string, topic: string, previousLessons: string[]) => {
-  return executeWithRotation(async (ai) => {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: `Discipline: ${discipline}. Topic: ${topic}.`,
-      config: {
-        systemInstruction: "You are a curriculum designer. Output JSON with fields: title, content, explanation.",
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            content: { type: Type.STRING },
-            explanation: { type: Type.STRING },
-          },
-          required: ["title", "content", "explanation"]
-        }
-      }
-    });
-    return JSON.parse(response.text || '{}');
   });
 };
