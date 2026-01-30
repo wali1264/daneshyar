@@ -2,29 +2,24 @@
 import { Type, Modality } from "@google/genai";
 
 /**
- * Standard Proxy Caller
- * Routes all AI requests through the Vercel Serverless Proxy.
- * This ensures 100% bypass of regional blocks and hides API keys.
+ * Standard Proxy Bridge
+ * Routes all AI requests through our secure Vercel-based server function.
  */
 async function callProxy(payload: any) {
   try {
     const response = await fetch('/api/proxy', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
 
     const data = await response.json();
-
     if (!response.ok) {
-      throw new Error(data.error || 'ارتباط با سرور هوش مصنوعی برقرار نشد.');
+      throw new Error(data.error || 'Server bridge failed to respond.');
     }
-
     return data;
   } catch (error: any) {
-    console.error('[GeminiService] Connection Failed:', error.message);
+    console.error('[Bridge Failure]:', error.message);
     throw error;
   }
 }
@@ -67,15 +62,11 @@ export async function decodeAudioData(
   return buffer;
 }
 
-/**
- * Professional AI Teacher Methods
- */
-
 export const generateLessonSpeech = async (text: string) => {
   const result = await callProxy({
     action: 'generateContent',
     model: 'gemini-2.5-flash-preview-tts',
-    contents: [{ parts: [{ text: `خوانش آموزشی متن: ${text}` }] }],
+    contents: [{ parts: [{ text: `Say clearly: ${text}` }] }],
     config: {
       responseModalities: [Modality.AUDIO],
       speechConfig: {
@@ -90,45 +81,21 @@ export const getAITeacherResponse = async (prompt: string, context: string, user
   const result = await callProxy({
     action: 'generateContent',
     model: 'gemini-3-pro-preview',
-    contents: [{ parts: [{ text: `Context: ${context}\n\nUser Question: ${prompt}` }] }],
+    contents: [{ parts: [{ text: `Context: ${context}\n\nUser: ${prompt}` }] }],
     config: {
-      systemInstruction: `تو مربی برنامه‌نویسی "${userName}" هستی. پاسخ‌ها به زبان فارسی، علمی و کوتاه باشد. کدها را در <hl>...</hl> قرار بده.`,
+      systemInstruction: `You are the AI mentor for "${userName}". Respond in Persian, concise and academic. Use <hl>...</hl> for code snippets.`,
     },
   });
-  return result.text || '';
-};
-
-export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: any, relatedTitles: string[]) => {
-  const result = await callProxy({
-    action: 'generateContent',
-    model: 'gemini-3-pro-preview',
-    contents: [{ parts: [{ text: `Teacher Prompt: ${teacherPrompt}\nLesson: ${JSON.stringify(currentLesson)}` }] }],
-    config: {
-      systemInstruction: "You are a Senior Academic Peer AI. Assist in curriculum development in Persian.",
-    }
-  });
-  return result.text || '';
-};
-
-export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: string[]) => {
-  const result = await callProxy({
-    action: 'generateContent',
-    model: 'gemini-3-pro-preview',
-    contents: [{ parts: [{ text: `Audit Lesson: ${JSON.stringify(lesson)}` }] }],
-    config: {
-      systemInstruction: "You are a Senior Auditor. Analyze for pedagogical accuracy in Persian.",
-    }
-  });
-  return result.text || '';
+  return result.candidates?.[0]?.content?.parts?.[0]?.text || '';
 };
 
 export const generateLessonSuggestion = async (discipline: string, topic: string, previousLessons: string[]) => {
   const result = await callProxy({
     action: 'generateContent',
     model: 'gemini-3-pro-preview',
-    contents: [{ parts: [{ text: `Topic: ${topic} for ${discipline}` }] }],
+    contents: [{ parts: [{ text: `Topic: ${topic}. Discipline: ${discipline}.` }] }],
     config: {
-      systemInstruction: "Design a new lesson. Output JSON with fields: title, content, explanation.",
+      systemInstruction: "Curriculum designer mode. Output JSON only.",
       responseMimeType: "application/json",
       responseSchema: {
         type: Type.OBJECT,
@@ -141,17 +108,46 @@ export const generateLessonSuggestion = async (discipline: string, topic: string
       }
     }
   });
-  return JSON.parse(result.text || '{}');
+  // The response from the proxy for generateContent returns GenerateContentResponse structure
+  const text = result.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  return JSON.parse(text);
+};
+
+export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: any, related: string[]) => {
+  const result = await callProxy({
+    action: 'generateContent',
+    model: 'gemini-3-pro-preview',
+    contents: [{ parts: [{ text: `Advice on: ${teacherPrompt}` }] }],
+    config: {
+      systemInstruction: "Senior Academic Peer AI. Persian language.",
+    }
+  });
+  return result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+};
+
+export const getAdminAuditReport = async (lesson: any, related: string[]) => {
+  const result = await callProxy({
+    action: 'generateContent',
+    model: 'gemini-3-pro-preview',
+    contents: [{ parts: [{ text: `Audit: ${JSON.stringify(lesson)}` }] }],
+    config: {
+      systemInstruction: "Academic Auditor AI. Persian language.",
+    }
+  });
+  return result.candidates?.[0]?.content?.parts?.[0]?.text || '';
 };
 
 /**
- * Note: WebSocket (Live) connection bypasses serverless proxy due to protocol limitations.
- * It will use the client's direct connection with fallback mechanisms.
+ * Live API Note:
+ * WSS (WebSockets) requires a direct client connection. 
+ * For users without VPN, we recommend using the REST-based Mentorship (Chat) 
+ * provided by the Proxy Bridge above.
  */
 export const connectLiveTeacher = async (callbacks: any, userName: string, context: string) => {
-  const { GoogleGenAI: GenAI } = await import("@google/genai");
-  // Temporary empty key as placeholder (Live API requires client-side key or direct tunnel)
-  const ai = new GenAI({ apiKey: "SERVER_MANAGED" });
+  const { GoogleGenAI } = await import("@google/genai");
+  // We provide a dummy key here because the real connection happens on client
+  // In a production app, WSS would need a dedicated WebSocket Proxy server.
+  const ai = new GoogleGenAI({ apiKey: 'PROXY_MANAGED' }); 
   return ai.live.connect({
     model: 'gemini-2.5-flash-native-audio-preview-12-2025',
     callbacks,
@@ -160,7 +156,7 @@ export const connectLiveTeacher = async (callbacks: any, userName: string, conte
       speechConfig: {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
       },
-      systemInstruction: `تو مربی زنده "${userName}" هستی. کانتکست: ${context}`,
+      systemInstruction: `Live Mentor Mode for ${userName}. Context: ${context}`,
     }
   });
 };
