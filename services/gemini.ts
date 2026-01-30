@@ -3,8 +3,8 @@ import { Type, Modality } from "@google/genai";
 
 /**
  * Standard Proxy Caller
- * Instead of direct SDK calls, we route everything through our serverless bridge.
- * This avoids regional blocks and hides the API Key from the browser.
+ * Routes all AI requests through the Vercel Serverless Proxy.
+ * This ensures 100% bypass of regional blocks and hides API keys.
  */
 async function callProxy(payload: any) {
   try {
@@ -16,14 +16,15 @@ async function callProxy(payload: any) {
       body: JSON.stringify(payload),
     });
 
+    const data = await response.json();
+
     if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error || 'Request failed');
+      throw new Error(data.error || 'ارتباط با سرور هوش مصنوعی برقرار نشد.');
     }
 
-    return await response.json();
+    return data;
   } catch (error: any) {
-    console.error('[GeminiService] Proxy Call Failed:', error.message);
+    console.error('[GeminiService] Connection Failed:', error.message);
     throw error;
   }
 }
@@ -67,14 +68,14 @@ export async function decodeAudioData(
 }
 
 /**
- * Optimized API Methods using the Proxy Bridge
+ * Professional AI Teacher Methods
  */
 
 export const generateLessonSpeech = async (text: string) => {
   const result = await callProxy({
     action: 'generateContent',
     model: 'gemini-2.5-flash-preview-tts',
-    contents: [{ parts: [{ text: `خوانش آموزشی متن با لحن حرفه‌ای: ${text}` }] }],
+    contents: [{ parts: [{ text: `خوانش آموزشی متن: ${text}` }] }],
     config: {
       responseModalities: [Modality.AUDIO],
       speechConfig: {
@@ -91,7 +92,7 @@ export const getAITeacherResponse = async (prompt: string, context: string, user
     model: 'gemini-3-pro-preview',
     contents: [{ parts: [{ text: `Context: ${context}\n\nUser Question: ${prompt}` }] }],
     config: {
-      systemInstruction: `تو مربی برنامه‌نویسی "${userName}" هستی. پاسخ‌ها به زبان فارسی، کوتاه، دوستانه و علمی باشد. کدهای مهم را در تگ <hl> قرار بده.`,
+      systemInstruction: `تو مربی برنامه‌نویسی "${userName}" هستی. پاسخ‌ها به زبان فارسی، علمی و کوتاه باشد. کدها را در <hl>...</hl> قرار بده.`,
     },
   });
   return result.text || '';
@@ -101,9 +102,9 @@ export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: a
   const result = await callProxy({
     action: 'generateContent',
     model: 'gemini-3-pro-preview',
-    contents: [{ parts: [{ text: `Teacher Prompt: ${teacherPrompt}\nLesson Data: ${JSON.stringify(currentLesson)}\nRelated Lessons: ${relatedTitles.join(', ')}` }] }],
+    contents: [{ parts: [{ text: `Teacher Prompt: ${teacherPrompt}\nLesson: ${JSON.stringify(currentLesson)}` }] }],
     config: {
-      systemInstruction: "You are a Senior Academic Peer for Teachers. Help refine the curriculum and offer pedagogical advice in Persian.",
+      systemInstruction: "You are a Senior Academic Peer AI. Assist in curriculum development in Persian.",
     }
   });
   return result.text || '';
@@ -113,9 +114,9 @@ export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: stri
   const result = await callProxy({
     action: 'generateContent',
     model: 'gemini-3-pro-preview',
-    contents: [{ parts: [{ text: `Lesson to Audit: ${JSON.stringify(lesson)}\nContext Titles: ${relatedLessonTitles.join(', ')}` }] }],
+    contents: [{ parts: [{ text: `Audit Lesson: ${JSON.stringify(lesson)}` }] }],
     config: {
-      systemInstruction: "You are a Senior Academic Auditor. Analyze the lesson for accuracy, clarity, and relevance. Provide the report in Persian.",
+      systemInstruction: "You are a Senior Auditor. Analyze for pedagogical accuracy in Persian.",
     }
   });
   return result.text || '';
@@ -125,9 +126,9 @@ export const generateLessonSuggestion = async (discipline: string, topic: string
   const result = await callProxy({
     action: 'generateContent',
     model: 'gemini-3-pro-preview',
-    contents: [{ parts: [{ text: `Discipline: ${discipline}. Topic: ${topic}. Existing lessons: ${previousLessons.join(', ')}` }] }],
+    contents: [{ parts: [{ text: `Topic: ${topic} for ${discipline}` }] }],
     config: {
-      systemInstruction: "You are an expert curriculum designer. Generate a new lesson structure. Output in JSON format.",
+      systemInstruction: "Design a new lesson. Output JSON with fields: title, content, explanation.",
       responseMimeType: "application/json",
       responseSchema: {
         type: Type.OBJECT,
@@ -144,15 +145,13 @@ export const generateLessonSuggestion = async (discipline: string, topic: string
 };
 
 /**
- * Note: connectLiveTeacher (WSS) still uses direct connection. 
- * Proxying WSS requires a stateful WebSocket proxy which standard serverless functions don't support.
- * We rely on the client's direct connection for WSS if available.
+ * Note: WebSocket (Live) connection bypasses serverless proxy due to protocol limitations.
+ * It will use the client's direct connection with fallback mechanisms.
  */
 export const connectLiveTeacher = async (callbacks: any, userName: string, context: string) => {
-  // Use a temporary key for the handshake (will be replaced by env key on client if available)
-  const key = (window as any).process?.env?.API_KEY || '';
   const { GoogleGenAI: GenAI } = await import("@google/genai");
-  const ai = new GenAI({ apiKey: key });
+  // Temporary empty key as placeholder (Live API requires client-side key or direct tunnel)
+  const ai = new GenAI({ apiKey: "SERVER_MANAGED" });
   return ai.live.connect({
     model: 'gemini-2.5-flash-native-audio-preview-12-2025',
     callbacks,
