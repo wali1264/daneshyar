@@ -66,6 +66,7 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const recognitionRef = useRef<any>(null);
+  const silenceTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
@@ -94,10 +95,7 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
       const cleanResponse = response.replace(/<hl>|<\/hl>/g, '');
       setChatMessages(prev => [...prev, { role: 'ai', text: cleanResponse }]);
       
-      // Auto-TTS for Chat in text mode for consistency
-      if (mode === HubMode.CHAT) {
-        speakText(cleanResponse);
-      }
+      // DEPRECATED: Auto-TTS for Chat removed as per user request
     } catch (e) {
       console.error(e);
       setChatMessages(prev => [...prev, { role: 'ai', text: "متأسفانه در حال حاضر مشکلی در ارتباط با سرور وجود دارد. لطفاً دوباره تلاش کنید." }]);
@@ -106,25 +104,12 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
     }
   };
 
-  const speakText = async (text: string) => {
-    try {
-      const audioData = await generateLessonSpeech(text);
-      if (audioData) {
-        if (!outputAudioContextRef.current) outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-        const buffer = await decodeAudioData(decodeBase64(audioData), outputAudioContextRef.current, 24000, 1);
-        const source = outputAudioContextRef.current.createBufferSource();
-        source.buffer = buffer;
-        source.connect(outputAudioContextRef.current.destination);
-        source.start();
-      }
-    } catch (e) { console.error("Speech generation failed:", e); }
-  };
-
   const startSTT = () => {
     const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
     if (!SpeechRecognition) return;
 
     if (sttStatus === 'recording') {
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
       recognitionRef.current?.stop();
       return;
     }
@@ -132,26 +117,45 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
     const recognition = new SpeechRecognition();
     recognition.lang = 'fa-IR';
     recognition.interimResults = true;
+    recognition.continuous = true; // Key for patience
     recognitionRef.current = recognition;
 
-    recognition.onstart = () => setSttStatus('recording');
+    const resetSilenceTimer = () => {
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+      silenceTimeoutRef.current = window.setTimeout(() => {
+        if (recognitionRef.current) recognitionRef.current.stop();
+      }, 3000); // 3 seconds patience before stopping
+    };
+
+    recognition.onstart = () => {
+      setSttStatus('recording');
+      resetSilenceTimer();
+    };
+    
     recognition.onresult = (event: any) => {
+      resetSilenceTimer();
       const transcript = Array.from(event.results)
         .map((result: any) => result[0].transcript)
         .join('');
       setChatInput(transcript);
     };
+    
     recognition.onerror = () => setSttStatus('error');
     recognition.onend = () => {
       setSttStatus('idle');
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
     };
+    
     recognition.start();
   };
 
-  const startVoiceSession = async () => {
-    setIsVoiceConnecting(true);
-    setVoiceTranscription('');
-    setLiveError(null);
+  const startVoiceSession = async (attempt = 1) => {
+    if (attempt === 1) {
+      setIsVoiceConnecting(true);
+      setVoiceTranscription('');
+      setLiveError(null);
+    }
+    
     try {
       const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
@@ -164,6 +168,7 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
         onopen: () => {
           setIsVoiceConnecting(false);
           setIsVoiceActive(true);
+          setLiveError(null);
           const source = inputCtx.createMediaStreamSource(stream);
           const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
           scriptProcessor.onaudioprocess = (e) => {
@@ -203,36 +208,49 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
           }
         },
         onclose: (e: CloseEvent) => {
-          console.warn("Live Session Closed:", e);
-          if (isVoiceConnecting) {
-             setLiveError("متأسفانه اتصال زنده به دلیل محدودیت‌های WebSocket در پروکسی ورسل در این منطقه امکان‌پذیر نیست. لطفاً از چت متنی و صوتی (REST) استفاده کنید.");
-             setTimeout(() => handleEndVoiceAction(), 4000);
-          } else {
-             handleEndVoiceAction();
+          console.warn(`Live Session Closed (Code: ${e.code}, Reason: ${e.reason})`);
+          // Close codes like 1011 (Internal Error) or 429 logic in proxy often result in unexpected close
+          if ((e.code === 1011 || e.code === 4000) && attempt < 3) {
+            console.log(`[Proxy Recovery] Quota limit likely hit. Attempting reconnect #${attempt + 1}...`);
+            setLiveError(`در حال بازنشانی فرکانس (تلاش ${attempt + 1})...`);
+            setTimeout(() => startVoiceSession(attempt + 1), 1000);
+          } else if (!isVoiceActive && !isVoiceConnecting) {
+             // Just a normal close
+          } else if (e.code !== 1000 && e.code !== 1005) {
+            setLiveError("اتصال زنده قطع شد. لطفاً دوباره تلاش کنید.");
+            setTimeout(() => handleEndVoiceAction(), 3000);
           }
         },
         onerror: (e: any) => {
           console.error("Live Session Error:", e);
-          setLiveError("خطا در اتصال به موتور زنده. در حال سوییچ به وضعیت چت متنی-صوتی...");
-          setTimeout(() => handleEndVoiceAction(), 3000);
+          if (attempt < 3) {
+            setTimeout(() => startVoiceSession(attempt + 1), 1000);
+          } else {
+            setLiveError("خطا در اتصال به موتور زنده. در حال سوییچ به وضعیت چت متنی-صوتی...");
+            setTimeout(() => handleEndVoiceAction(), 3000);
+          }
         }
       }, userName, context);
 
       sessionRef.current = await sessionPromise;
       
-      // Safety timeout
+      // Safety timeout for initial connection
       setTimeout(() => {
-        if (isVoiceConnecting && !isVoiceActive) {
-          setLiveError("زمان انتظار برای اتصال زنده تمام شد. به دلیل تحریم‌های پروتکل WSS، استفاده از چت متنی پیشنهاد می‌شود.");
+        if (isVoiceConnecting && !isVoiceActive && attempt >= 3) {
+          setLiveError("زمان انتظار تمام شد. استفاده از چت متنی پیشنهاد می‌شود.");
           setTimeout(() => handleEndVoiceAction(), 4000);
         }
-      }, 12000);
+      }, 15000);
 
     } catch (err: any) {
       console.error("Voice initialization failed:", err);
-      setIsVoiceConnecting(false);
-      setLiveError("امکان دسترسی به میکروفون یا سرور زنده وجود ندارد. لطفاً تنظیمات مرورگر را بررسی کنید.");
-      setTimeout(() => setMode(HubMode.CHAT), 4000);
+      if (attempt < 3) {
+        startVoiceSession(attempt + 1);
+      } else {
+        setIsVoiceConnecting(false);
+        setLiveError("امکان دسترسی به میکروفون یا سرور زنده وجود ندارد.");
+        setTimeout(() => setMode(HubMode.CHAT), 4000);
+      }
     }
   };
 
@@ -249,6 +267,7 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
     setIsVoiceConnecting(false);
     setVolume(0);
     nextStartTimeRef.current = 0;
+    sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
     sourcesRef.current.clear();
   };
 

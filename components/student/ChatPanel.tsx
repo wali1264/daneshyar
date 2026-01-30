@@ -17,6 +17,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ context, onHighlight, userName })
   const [isRecording, setIsRecording] = useState(false);
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const silenceTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
@@ -31,7 +32,6 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ context, onHighlight, userName })
     setLoading(true);
 
     try {
-      // Fix: Pass userName as the third argument to getAITeacherResponse to match its definition in services/gemini.ts
       const response = await getAITeacherResponse(messageText, context, userName);
       
       // Handle highlighting
@@ -55,14 +55,42 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ context, onHighlight, userName })
       return;
     }
 
+    if (isRecording) {
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+      return; // Actually handled by recognition instance in most browsers
+    }
+
     const recognition = new SpeechRecognition();
     recognition.lang = 'fa-IR';
-    recognition.onstart = () => setIsRecording(true);
-    recognition.onend = () => setIsRecording(false);
-    recognition.onresult = (event: any) => {
-      const transcript = event.results[0][0].transcript;
-      handleSend(transcript);
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    const resetTimer = () => {
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+      silenceTimeoutRef.current = window.setTimeout(() => {
+        recognition.stop();
+      }, 3000);
     };
+
+    recognition.onstart = () => {
+      setIsRecording(true);
+      resetTimer();
+    };
+    
+    recognition.onresult = (event: any) => {
+      resetTimer();
+      const transcript = Array.from(event.results)
+        .map((result: any) => result[0].transcript)
+        .join('');
+      setInput(transcript);
+    };
+
+    recognition.onend = () => {
+      setIsRecording(false);
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+      if (input.trim()) handleSend();
+    };
+
     recognition.start();
   };
 
