@@ -2,6 +2,36 @@
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 
 /**
+ * DaneshYar Edge Tunnel Interceptor
+ * This logic intercepts all fetch calls to Google APIs and redirects them 
+ * through our Vercel-hosted proxy to bypass regional restrictions (Iran/Afghanistan).
+ */
+const GOOGLE_API_HOST = "generativelanguage.googleapis.com";
+const PROXY_PATH = "/api/google-proxy";
+
+const originalFetch = window.fetch;
+window.fetch = async (...args: any[]) => {
+  const [resource, config] = args;
+  let url = typeof resource === "string" ? resource : resource instanceof URL ? resource.href : (resource as any).url;
+
+  if (url && url.includes(GOOGLE_API_HOST)) {
+    // Transparently rewrite the URL to use our Vercel Edge Proxy
+    const newUrl = url.replace(`https://${GOOGLE_API_HOST}`, PROXY_PATH);
+    
+    // Log for debugging during deployment
+    console.debug(`[EdgeTunnel] Routing through Vercel: ${newUrl}`);
+    
+    if (typeof resource !== "string" && !(resource instanceof URL)) {
+      const newRequest = new Request(newUrl, resource as RequestInit);
+      return originalFetch(newRequest, config);
+    }
+    return originalFetch(newUrl, config);
+  }
+
+  return originalFetch(resource, config);
+};
+
+/**
  * Smart Key Management System (KeyPool Engine)
  * Handles rate limits by rotating through available API keys.
  * Pattern: VITE_GOOGLE_GENAI_TOKEN, VITE_GOOGLE_GENAI_TOKEN_1, ..., VITE_GOOGLE_GENAI_TOKEN_500
@@ -17,30 +47,23 @@ class KeyManager {
   }
 
   private initPool() {
-    // Collect all possible environment sources
     const processEnv = (typeof process !== 'undefined' && process.env) ? process.env : {};
     const viteEnv = (import.meta as any).env || {};
-    
-    // Merge environments priority: process.env (Vercel/Node) > viteEnv (Local build)
     const env = { ...viteEnv, ...processEnv };
     
     const foundKeyNames: string[] = [];
     const pool: string[] = [];
 
-    // 1. Check Standard API_KEY (System requirement)
     if (env.API_KEY) {
       pool.push(env.API_KEY);
       foundKeyNames.push('API_KEY');
     }
 
-    // 2. Check the BASE key (The one without numbers)
     if (env.VITE_GOOGLE_GENAI_TOKEN) {
       pool.push(env.VITE_GOOGLE_GENAI_TOKEN);
       foundKeyNames.push('VITE_GOOGLE_GENAI_TOKEN');
     }
 
-    // 3. Scan for numbered keys starting from 1 to 500
-    // As per user: Key 2 is _1, Key 3 is _2, etc.
     for (let i = 1; i <= 500; i++) {
       const keyName = `VITE_GOOGLE_GENAI_TOKEN_${i}`;
       if (env[keyName]) {
@@ -52,12 +75,9 @@ class KeyManager {
     this.keys = pool;
     
     if (this.keys.length > 0) {
-      console.log(`[KeyManager] 🛡️ Smart Guard Active!`);
-      console.log(`[KeyManager] Found ${this.keys.length} keys:`, foundKeyNames.join(', '));
+      console.log(`[KeyManager] 🛡️ Smart Guard Active! Found ${this.keys.length} keys.`);
     } else {
-      console.error(`[KeyManager] 🚨 CRITICAL ERROR: No API keys were detected in the environment!`);
-      console.log(`[KeyManager] Checked sources: process.env and import.meta.env`);
-      // Fallback to process.env.API_KEY if everything else fails (Internal instruction)
+      console.error(`[KeyManager] 🚨 CRITICAL ERROR: No API keys detected!`);
       if (process.env.API_KEY) {
           this.keys = [process.env.API_KEY];
       }
@@ -65,33 +85,24 @@ class KeyManager {
   }
 
   public getNextHealthyKey(): string {
-    if (this.keys.length === 0) {
-        return process.env.API_KEY || '';
-    }
-
+    if (this.keys.length === 0) return process.env.API_KEY || '';
     const now = Date.now();
     let attempts = 0;
-
     while (attempts < this.keys.length) {
       const key = this.keys[this.currentIndex];
       const cooldownUntil = this.cooldowns.get(key) || 0;
-
       if (now > cooldownUntil) {
         const selectedKey = key;
         this.currentIndex = (this.currentIndex + 1) % this.keys.length;
         return selectedKey;
       }
-
       this.currentIndex = (this.currentIndex + 1) % this.keys.length;
       attempts++;
     }
-
-    // If all are in cooldown, return the first one as last resort
     return this.keys[0];
   }
 
   public markAsLimited(key: string) {
-    console.warn(`[KeyManager] ⚠️ Rate limit reached. Rotating to next key...`);
     this.cooldowns.set(key, Date.now() + this.COOLDOWN_TIME);
   }
 
@@ -108,9 +119,7 @@ async function executeWithRotation<T>(operation: (ai: GoogleGenAI) => Promise<T>
 
   for (let i = 0; i < maxRetries; i++) {
     const key = keyManager.getNextHealthyKey();
-    if (!key) throw new Error("API key is missing or not configured correctly.");
-    
-    // Always create a new instance to ensure the latest key is used
+    if (!key) throw new Error("API key is missing.");
     const ai = new GoogleGenAI({ apiKey: key });
 
     try {
@@ -118,28 +127,17 @@ async function executeWithRotation<T>(operation: (ai: GoogleGenAI) => Promise<T>
     } catch (err: any) {
       lastError = err;
       const errorMsg = err.message?.toLowerCase() || '';
-      
-      // Handle Rate Limits (429)
       if (errorMsg.includes('429') || errorMsg.includes('quota') || errorMsg.includes('limit')) {
         keyManager.markAsLimited(key);
         continue;
       }
-      
-      // Handle Invalid Key
-      if (errorMsg.includes('entity was not found') || errorMsg.includes('invalid api key')) {
-        console.error(`[KeyManager] ❌ Invalid Key Detected: ${key.substring(0, 6)}...`);
-        continue;
-      }
-      
+      if (errorMsg.includes('entity was not found') || errorMsg.includes('invalid api key')) continue;
       throw err;
     }
   }
   throw lastError;
 }
 
-/**
- * Audio Utilities
- */
 export function decodeBase64(base64: string) {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -177,10 +175,6 @@ export async function decodeAudioData(
   }
   return buffer;
 }
-
-/**
- * AI Services
- */
 
 export const generateLessonSpeech = async (text: string) => {
   return executeWithRotation(async (ai) => {
