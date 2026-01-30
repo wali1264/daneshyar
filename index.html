@@ -54,33 +54,8 @@
     <script type="module" src="./index.tsx"></script>
 
     <script>
-      let refreshing = false;
-
-      if ('serviceWorker' in navigator) {
-        window.addEventListener('load', () => {
-          navigator.serviceWorker.register('/sw.js')
-            .then(reg => {
-              console.log('[System] Service Worker registered');
-              
-              reg.onupdatefound = () => {
-                const installingWorker = reg.installing;
-                installingWorker.onstatechange = () => {
-                  if (installingWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                    console.log('[System] New update detected');
-                  }
-                };
-              };
-            })
-            .catch(err => console.error('[System] SW registration failed:', err));
-        });
-
-        navigator.serviceWorker.addEventListener('controllerchange', () => {
-          if (!refreshing) {
-            refreshing = true;
-            window.location.reload();
-          }
-        });
-      }
+      // Service Worker registration disabled in preview to prevent origin mismatch errors.
+      console.log('[System] Environment: Preview. Service Worker bypassed.');
     </script>
   <script type="module" src="/index.tsx"></script>
 </body>

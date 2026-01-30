@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { getAITeacherResponse, connectLiveTeacher, decodeBase64, encodeBase64, decodeAudioData } from '../../services/gemini';
+import { getAITeacherResponse, connectLiveTeacher, decodeBase64, encodeBase64, decodeAudioData, generateLessonSpeech } from '../../services/gemini';
 import Button from '../ui/Button';
 
 interface SenseiHubProps {
@@ -91,13 +91,33 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
 
     try {
       const response = await getAITeacherResponse(msgText, context, userName);
-      setChatMessages(prev => [...prev, { role: 'ai', text: response.replace(/<hl>|<\/hl>/g, '') }]);
+      const cleanResponse = response.replace(/<hl>|<\/hl>/g, '');
+      setChatMessages(prev => [...prev, { role: 'ai', text: cleanResponse }]);
+      
+      // Auto-TTS for Chat in text mode for consistency
+      if (mode === HubMode.CHAT) {
+        speakText(cleanResponse);
+      }
     } catch (e) {
       console.error(e);
       setChatMessages(prev => [...prev, { role: 'ai', text: "متأسفانه در حال حاضر مشکلی در ارتباط با سرور وجود دارد. لطفاً دوباره تلاش کنید." }]);
     } finally {
       setLoadingChat(false);
     }
+  };
+
+  const speakText = async (text: string) => {
+    try {
+      const audioData = await generateLessonSpeech(text);
+      if (audioData) {
+        if (!outputAudioContextRef.current) outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+        const buffer = await decodeAudioData(decodeBase64(audioData), outputAudioContextRef.current, 24000, 1);
+        const source = outputAudioContextRef.current.createBufferSource();
+        source.buffer = buffer;
+        source.connect(outputAudioContextRef.current.destination);
+        source.start();
+      }
+    } catch (e) { console.error("Speech generation failed:", e); }
   };
 
   const startSTT = () => {
@@ -158,7 +178,7 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
             const pcmBase64 = encodeBase64(new Uint8Array(int16.buffer));
             sessionPromise.then(session => {
               session.sendRealtimeInput({ media: { data: pcmBase64, mimeType: 'audio/pcm;rate=16000' } });
-            });
+            }).catch(() => {});
             setVolume(Math.min(100, (sum / l) * 500));
           };
           source.connect(scriptProcessor);
@@ -184,30 +204,35 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
         },
         onclose: (e: CloseEvent) => {
           console.warn("Live Session Closed:", e);
-          handleEndVoiceAction();
+          if (isVoiceConnecting) {
+             setLiveError("متأسفانه اتصال زنده به دلیل محدودیت‌های WebSocket در پروکسی ورسل در این منطقه امکان‌پذیر نیست. لطفاً از چت متنی و صوتی (REST) استفاده کنید.");
+             setTimeout(() => handleEndVoiceAction(), 4000);
+          } else {
+             handleEndVoiceAction();
+          }
         },
         onerror: (e: any) => {
           console.error("Live Session Error:", e);
-          setLiveError("متأسفانه اتصال زنده به دلیل محدودیت‌های شبکه برقرار نشد. در حال سوییچ به حالت متنی...");
+          setLiveError("خطا در اتصال به موتور زنده. در حال سوییچ به وضعیت چت متنی-صوتی...");
           setTimeout(() => handleEndVoiceAction(), 3000);
         }
       }, userName, context);
 
       sessionRef.current = await sessionPromise;
       
-      // Auto-fallback timeout if connection stays in "connecting" too long
+      // Safety timeout
       setTimeout(() => {
         if (isVoiceConnecting && !isVoiceActive) {
-          setLiveError("زمان انتظار برای اتصال زنده تمام شد. لطفاً از چت متنی استفاده کنید.");
-          setTimeout(() => handleEndVoiceAction(), 2000);
+          setLiveError("زمان انتظار برای اتصال زنده تمام شد. به دلیل تحریم‌های پروتکل WSS، استفاده از چت متنی پیشنهاد می‌شود.");
+          setTimeout(() => handleEndVoiceAction(), 4000);
         }
-      }, 10000);
+      }, 12000);
 
     } catch (err: any) {
       console.error("Voice initialization failed:", err);
       setIsVoiceConnecting(false);
-      setLiveError("امکان دسترسی به میکروفون یا سرور زنده وجود ندارد.");
-      setTimeout(() => setMode(HubMode.CHAT), 2000);
+      setLiveError("امکان دسترسی به میکروفون یا سرور زنده وجود ندارد. لطفاً تنظیمات مرورگر را بررسی کنید.");
+      setTimeout(() => setMode(HubMode.CHAT), 4000);
     }
   };
 
@@ -256,7 +281,7 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
           <span>💬</span> چت متنی
         </button>
         <button onClick={() => setMode(HubMode.VOICE)} className={`flex-1 py-4 rounded-2xl font-black text-[12px] transition-all flex items-center justify-center gap-2 ${mode === HubMode.VOICE ? 'bg-white text-blue-600 shadow-xl scale-[1.02] border border-slate-200' : 'text-slate-400 hover:text-slate-600'}`}>
-          <span>🎙️</span> تعامل صوتی
+          <span>🎙️</span> تعامل زنده (WSS)
         </button>
       </div>
 
@@ -281,17 +306,17 @@ const SenseiHub: React.FC<SenseiHubProps> = ({ isOpen, onClose, context, userNam
                {isVoiceActive && <div className="absolute inset-0 rounded-[3.5rem] border-2 border-blue-400 animate-ping opacity-25" style={{ transform: `scale(${1 + volume/200})` }}></div>}
              </div>
 
-             <div className="space-y-3">
+             <div className="space-y-3 px-6">
                <h3 className="text-2xl font-black text-slate-800 tracking-tight">
-                 {isVoiceConnecting ? 'در حال عبور از محدودیت‌ها...' : isVoiceActive ? `در حال گفتگو با ${userName}` : 'در انتظار اتصال...'}
+                 {isVoiceConnecting ? 'در حال عبور از محدودیت‌های شبکه...' : isVoiceActive ? `در حال گفتگو با ${userName}` : 'در انتظار اتصال...'}
                </h3>
                <p className={`text-[11px] font-black uppercase tracking-[0.3em] ${liveError ? 'text-rose-500' : 'text-blue-500 opacity-80'}`}>
-                 {liveError || (isVoiceActive ? 'BYPASSING_RESTRICTIONS_ACTIVE' : 'INITIALIZING_SECURE_TUNNEL')}
+                 {liveError ? 'SECURITY_PROTOCOL_BLOCKED' : (isVoiceActive ? 'BYPASSING_RESTRICTIONS_ACTIVE' : 'INITIALIZING_SECURE_TUNNEL')}
                </p>
              </div>
 
              {liveError && (
-               <div className="bg-rose-50 text-rose-600 p-6 rounded-3xl border border-rose-100 text-[10px] font-black leading-loose animate-bounce">
+               <div className="bg-rose-50 text-rose-600 p-6 rounded-3xl border border-rose-100 text-[10px] font-black leading-loose animate-bounce mx-6">
                  {liveError}
                </div>
              )}

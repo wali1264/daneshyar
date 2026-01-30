@@ -2,64 +2,8 @@
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 
 /**
- * DaneshYar Advanced Edge Tunnel Interceptor
- * Intercepts all fetch/websocket calls to Google APIs to handle regional restrictions.
- */
-const GOOGLE_API_HOST = "generativelanguage.googleapis.com";
-const PROXY_PATH = "/api/google-proxy";
-
-// 1. Fetch Interceptor for REST APIs (Text, Audio, Images)
-const originalFetch = window.fetch;
-window.fetch = async (...args: any[]) => {
-  const [resource, config] = args;
-  let url = typeof resource === "string" ? resource : resource instanceof URL ? resource.href : (resource as any).url;
-
-  if (url && url.includes(GOOGLE_API_HOST)) {
-    const newUrl = url.replace(`https://${GOOGLE_API_HOST}`, PROXY_PATH);
-    
-    // Ensure the key is also caught if it's in the query params
-    const updatedUrl = newUrl.includes('key=') ? newUrl : newUrl;
-
-    console.debug(`[EdgeTunnel] Routing HTTP request: ${updatedUrl}`);
-    
-    // Create a new request object to avoid sealed/used request errors
-    if (resource instanceof Request) {
-      const headers = new Headers(resource.headers);
-      const newRequest = new Request(updatedUrl, {
-        method: resource.method,
-        headers: headers,
-        body: resource.body,
-        referrer: resource.referrer,
-        mode: 'cors', // Force CORS to handle rewrite properly
-        credentials: resource.credentials,
-      });
-      return originalFetch(newRequest);
-    }
-    
-    return originalFetch(updatedUrl, config);
-  }
-
-  return originalFetch(resource, config);
-};
-
-// 2. WebSocket Guard (Live API)
-// Since Vercel rewrites don't support WSS, we flag failures for the app to handle fallback.
-const OriginalWebSocket = window.WebSocket;
-(window as any).WebSocket = function(url: string, protocols?: string | string[]) {
-  if (url.includes(GOOGLE_API_HOST)) {
-    console.warn(`[EdgeTunnel] WebSocket (WSS) call detected to restricted domain. 
-      Vercel Rewrites do not support WSS. Fallback to REST mode is recommended.`);
-    
-    // We add a custom property to the instance for the app to check
-    const ws = new OriginalWebSocket(url, protocols);
-    (ws as any).isGoogleLive = true;
-    return ws;
-  }
-  return new OriginalWebSocket(url, protocols);
-};
-
-/**
  * Smart Key Management System (KeyPool Engine)
+ * Handles API key rotation and health checks without intercepting global fetch.
  */
 class KeyManager {
   private keys: string[] = [];
@@ -90,7 +34,7 @@ class KeyManager {
     if (this.keys.length > 0) {
       console.log(`[KeyManager] 🛡️ Smart Guard Active! Found ${this.keys.length} keys.`);
     } else {
-      console.error(`[KeyManager] 🚨 NO API KEYS FOUND! Using default fallback.`);
+      console.warn(`[KeyManager] 🚨 NO API KEYS FOUND in environment!`);
     }
   }
 
@@ -136,18 +80,12 @@ async function executeWithRotation<T>(operation: (ai: GoogleGenAI) => Promise<T>
     } catch (err: any) {
       lastError = err;
       const errorMsg = err.message?.toLowerCase() || '';
-      console.error(`[KeyRotation] Attempt ${i+1} failed with key ${key.slice(0, 6)}... : ${errorMsg}`);
+      console.error(`[KeyRotation] Attempt ${i+1} failed: ${errorMsg}`);
       
       if (errorMsg.includes('429') || errorMsg.includes('quota') || errorMsg.includes('limit')) {
         keyManager.markAsLimited(key);
         continue;
       }
-      if (errorMsg.includes('403') || errorMsg.includes('forbidden') || errorMsg.includes('permission denied')) {
-        // Most likely geoblocking despite proxy - mark this key and move on
-        keyManager.markAsLimited(key);
-        continue;
-      }
-      if (errorMsg.includes('entity was not found') || errorMsg.includes('invalid api key')) continue;
       throw err;
     }
   }
@@ -196,7 +134,7 @@ export const generateLessonSpeech = async (text: string) => {
   return executeWithRotation(async (ai) => {
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: `خوانش شمرده و آموزشی متن زیر برای دانشجو: ${text}` }] }],
+      contents: [{ parts: [{ text: `خوانش آموزشی متن: ${text}` }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
@@ -212,35 +150,9 @@ export const getAITeacherResponse = async (prompt: string, context: string, user
   return executeWithRotation(async (ai) => {
     const response = await ai.models.generateContent({
       model: 'gemini-3-pro-preview',
-      contents: `Rich Learning Context: ${context}\n\nStudent's Current Query: ${prompt}`,
+      contents: `Context: ${context}\n\nUser: ${prompt}`,
       config: {
-        systemInstruction: `تو مربی فوق تخصص برنامه‌نویسی و همراه شخصی "${userName}" هستی. پاسخ‌ها به فارسی باشد. کدهای مهم را در <hl>...</hl> قرار بده.`,
-      },
-    });
-    return response.text || '';
-  });
-};
-
-export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: any, relatedLessons: string[]) => {
-  return executeWithRotation(async (ai) => {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: `Teacher Question: ${teacherPrompt}\n\nTarget Lesson: ${JSON.stringify(currentLesson)}\n\nOther lessons: ${relatedLessons.join(', ')}`,
-      config: {
-        systemInstruction: "You are a Senior Academic Peer AI for Teachers. Speak Persian.",
-      }
-    });
-    return response.text || '';
-  });
-};
-
-export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: string[]) => {
-  return executeWithRotation(async (ai) => {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: `Lesson to Audit: ${JSON.stringify(lesson)}\n\nRelated: ${relatedLessonTitles.join(', ')}`,
-      config: {
-        systemInstruction: "You are a Senior Academic Auditor for Danesh Yar Academy. Speak Persian.",
+        systemInstruction: `تو مربی برنامه‌نویسی "${userName}" هستی. پاسخ‌ها کوتاه و به فارسی باشد. کدهای مهم را در <hl>...</hl> قرار بده.`,
       },
     });
     return response.text || '';
@@ -258,10 +170,34 @@ export const connectLiveTeacher = async (callbacks: any, userName: string, conte
       speechConfig: {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
       },
-      systemInstruction: `تو مربی زنده و شخصی "${userName}" هستی. کانتکست: ${context}`,
-      outputAudioTranscription: {},
-      inputAudioTranscription: {},
+      systemInstruction: `تو مربی زنده "${userName}" هستی. کانتکست: ${context}`,
     }
+  });
+};
+
+export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: any, relatedLessons: string[]) => {
+  return executeWithRotation(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-pro-preview',
+      contents: `Teacher Question: ${teacherPrompt}\nTarget Lesson: ${JSON.stringify(currentLesson)}`,
+      config: {
+        systemInstruction: "You are a Senior Academic Peer AI for Teachers. Speak Persian.",
+      }
+    });
+    return response.text || '';
+  });
+};
+
+export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: string[]) => {
+  return executeWithRotation(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-pro-preview',
+      contents: `Lesson to Audit: ${JSON.stringify(lesson)}`,
+      config: {
+        systemInstruction: "You are a Senior Academic Auditor. Speak Persian.",
+      },
+    });
+    return response.text || '';
   });
 };
 
@@ -269,7 +205,7 @@ export const generateLessonSuggestion = async (discipline: string, topic: string
   return executeWithRotation(async (ai) => {
     const response = await ai.models.generateContent({
       model: 'gemini-3-pro-preview',
-      contents: `Discipline: ${discipline}. Topic: ${topic}. History: ${previousLessons.join(', ')}.`,
+      contents: `Discipline: ${discipline}. Topic: ${topic}.`,
       config: {
         systemInstruction: "You are a curriculum designer. Output JSON with fields: title, content, explanation.",
         responseMimeType: "application/json",
