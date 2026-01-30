@@ -2,8 +2,7 @@
 import { Type, Modality } from "@google/genai";
 
 /**
- * Standard Proxy Bridge
- * Routes all AI requests through our secure Vercel-based server function.
+ * Standard Proxy Bridge with Intelligent Logging
  */
 async function callProxy(payload: any) {
   try {
@@ -14,12 +13,16 @@ async function callProxy(payload: any) {
     });
 
     const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || 'Server bridge failed to respond.');
+    if (!response.ok) throw new Error(data.error || 'Bridge failure');
+
+    // Advanced logging for debugging the 500-key pool
+    if (data._proxyMetadata) {
+      console.log(`%c[Proxy Success] Key: ${data._proxyMetadata.keyName} | Attempts: ${data._proxyMetadata.attempts} | Healthy Keys in Pool: ${data._proxyMetadata.poolSize}`, "color: #10b981; font-weight: bold;");
     }
+
     return data;
   } catch (error: any) {
-    console.error('[Bridge Failure]:', error.message);
+    console.error(`%c[Proxy Failure] ${error.message}`, "color: #ef4444; font-weight: bold;");
     throw error;
   }
 }
@@ -62,6 +65,7 @@ export async function decodeAudioData(
   return buffer;
 }
 
+// Models switched to Flash as per instructions to prevent 429 errors
 export const generateLessonSpeech = async (text: string) => {
   const result = await callProxy({
     action: 'generateContent',
@@ -80,7 +84,7 @@ export const generateLessonSpeech = async (text: string) => {
 export const getAITeacherResponse = async (prompt: string, context: string, userName: string) => {
   const result = await callProxy({
     action: 'generateContent',
-    model: 'gemini-3-pro-preview',
+    model: 'gemini-3-flash-preview',
     contents: [{ parts: [{ text: `Context: ${context}\n\nUser: ${prompt}` }] }],
     config: {
       systemInstruction: `You are the AI mentor for "${userName}". Respond in Persian, concise and academic. Use <hl>...</hl> for code snippets.`,
@@ -92,7 +96,7 @@ export const getAITeacherResponse = async (prompt: string, context: string, user
 export const generateLessonSuggestion = async (discipline: string, topic: string, previousLessons: string[]) => {
   const result = await callProxy({
     action: 'generateContent',
-    model: 'gemini-3-pro-preview',
+    model: 'gemini-3-flash-preview',
     contents: [{ parts: [{ text: `Topic: ${topic}. Discipline: ${discipline}.` }] }],
     config: {
       systemInstruction: "Curriculum designer mode. Output JSON only.",
@@ -108,7 +112,6 @@ export const generateLessonSuggestion = async (discipline: string, topic: string
       }
     }
   });
-  // The response from the proxy for generateContent returns GenerateContentResponse structure
   const text = result.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
   return JSON.parse(text);
 };
@@ -116,7 +119,7 @@ export const generateLessonSuggestion = async (discipline: string, topic: string
 export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: any, related: string[]) => {
   const result = await callProxy({
     action: 'generateContent',
-    model: 'gemini-3-pro-preview',
+    model: 'gemini-3-flash-preview',
     contents: [{ parts: [{ text: `Advice on: ${teacherPrompt}` }] }],
     config: {
       systemInstruction: "Senior Academic Peer AI. Persian language.",
@@ -128,7 +131,7 @@ export const getTeacherAiAdvice = async (teacherPrompt: string, currentLesson: a
 export const getAdminAuditReport = async (lesson: any, related: string[]) => {
   const result = await callProxy({
     action: 'generateContent',
-    model: 'gemini-3-pro-preview',
+    model: 'gemini-3-flash-preview',
     contents: [{ parts: [{ text: `Audit: ${JSON.stringify(lesson)}` }] }],
     config: {
       systemInstruction: "Academic Auditor AI. Persian language.",
@@ -138,16 +141,23 @@ export const getAdminAuditReport = async (lesson: any, related: string[]) => {
 };
 
 /**
- * Live API Note:
- * WSS (WebSockets) requires a direct client connection. 
- * For users without VPN, we recommend using the REST-based Mentorship (Chat) 
- * provided by the Proxy Bridge above.
+ * Dynamic Key Selection for Live API
+ * Fetches a healthy key from the proxy pool before initiating WSS
  */
 export const connectLiveTeacher = async (callbacks: any, userName: string, context: string) => {
   const { GoogleGenAI } = await import("@google/genai");
-  // We provide a dummy key here because the real connection happens on client
-  // In a production app, WSS would need a dedicated WebSocket Proxy server.
-  const ai = new GoogleGenAI({ apiKey: 'PROXY_MANAGED' }); 
+  
+  // 1. Fetch a fresh key from the pool via Proxy
+  const keyResponse = await fetch('/api/proxy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'getLiveKey' })
+  });
+  const { apiKey, keyName } = await keyResponse.json();
+  
+  console.log(`%c[Live API] Initializing session with key: ${keyName}`, "color: #3b82f6; font-weight: bold;");
+
+  const ai = new GoogleGenAI({ apiKey }); 
   return ai.live.connect({
     model: 'gemini-2.5-flash-native-audio-preview-12-2025',
     callbacks,
