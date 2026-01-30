@@ -11,13 +11,6 @@
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="دانش‌یار" />
-    
-    <!-- Process Shim for Browser Environment to prevent ReferenceError -->
-    <script>
-      if (typeof window.process === 'undefined') {
-        window.process = { env: {} };
-      }
-    </script>
 
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100;400;700&display=swap" rel="stylesheet">
@@ -67,24 +60,20 @@
         window.addEventListener('load', () => {
           navigator.serviceWorker.register('/sw.js')
             .then(reg => {
-              console.log('Service Worker registered');
+              console.log('[System] Service Worker registered');
               
-              // Handle updates: check for updates on every page load
               reg.onupdatefound = () => {
                 const installingWorker = reg.installing;
                 installingWorker.onstatechange = () => {
                   if (installingWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                    console.log('New version available, refreshing...');
-                    // The new SW has skipped waiting and taken over.
-                    // We can now safely reload.
+                    console.log('[System] New update detected');
                   }
                 };
               };
             })
-            .catch(err => console.error('Service Worker registration failed: ', err));
+            .catch(err => console.error('[System] SW registration failed:', err));
         });
 
-        // Detect when the new service worker takes control
         navigator.serviceWorker.addEventListener('controllerchange', () => {
           if (!refreshing) {
             refreshing = true;

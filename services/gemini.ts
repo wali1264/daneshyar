@@ -4,46 +4,55 @@ import { GoogleGenAI, Type, Modality } from "@google/genai";
 /**
  * Smart Key Management System (KeyPool Engine)
  * Handles rate limits by rotating through available API keys.
+ * Optimized for VITE_GOOGLE_GENAI_TOKEN and VITE_GOOGLE_GENAI_TOKEN_X (1-500)
  */
 class KeyManager {
   private keys: string[] = [];
   private currentIndex: number = 0;
   private cooldowns: Map<string, number> = new Map();
-  private readonly COOLDOWN_TIME = 65000; // ~1 minute cool-down for 429 errors
+  private readonly COOLDOWN_TIME = 65000;
 
   constructor() {
     this.initPool();
   }
 
   private initPool() {
-    // Safely access process.env in browser using the shim or direct access
-    const safeEnv = (typeof process !== 'undefined' && process.env) ? process.env : (window as any).process?.env || {};
+    // Robust environment detection
+    const env = (typeof process !== 'undefined' && process.env) ? process.env : (window as any).process?.env || {};
     const foundKeys: { name: string; val: string }[] = [];
 
-    // Prioritize the standard API_KEY if available
-    if (safeEnv.API_KEY) foundKeys.push({ name: 'API_KEY', val: safeEnv.API_KEY });
+    // 1. Check priority API_KEY
+    if (env.API_KEY) {
+      foundKeys.push({ name: 'API_KEY', val: env.API_KEY });
+    }
 
-    // Automatically discover all VITE_GOOGLE_GENAI_TOKEN variants
-    Object.keys(safeEnv).forEach(key => {
-      if (key.startsWith('VITE_GOOGLE_GENAI_TOKEN') && safeEnv[key]) {
-        foundKeys.push({ name: key, val: safeEnv[key]! });
+    // 2. Check VITE_GOOGLE_GENAI_TOKEN (Base key)
+    if (env.VITE_GOOGLE_GENAI_TOKEN) {
+      foundKeys.push({ name: 'VITE_GOOGLE_GENAI_TOKEN', val: env.VITE_GOOGLE_GENAI_TOKEN });
+    }
+
+    // 3. Scan for VITE_GOOGLE_GENAI_TOKEN_1 to VITE_GOOGLE_GENAI_TOKEN_500
+    for (let i = 1; i <= 500; i++) {
+      const keyName = `VITE_GOOGLE_GENAI_TOKEN_${i}`;
+      if (env[keyName]) {
+        foundKeys.push({ name: keyName, val: env[keyName] });
       }
-    });
-
-    // Professional sorting: Base first, then _1, _2, _3...
-    foundKeys.sort((a, b) => {
-      if (a.name === 'API_KEY') return -1;
-      if (b.name === 'API_KEY') return 1;
-      return a.name.localeCompare(b.name, undefined, { numeric: true });
-    });
+    }
 
     this.keys = foundKeys.map(k => k.val);
-    console.log(`[KeyManager] Pool initialized with ${this.keys.length} keys.`);
+    
+    if (this.keys.length > 0) {
+      console.log(`[KeyManager] 🛡️ Smart Guard Active: ${this.keys.length} API keys successfully loaded from environment.`);
+    } else {
+      console.error(`[KeyManager] 🚨 CRITICAL: No API keys found! Please check environment variables.`);
+    }
   }
 
   public getNextHealthyKey(): string {
-    const safeEnv = (typeof process !== 'undefined' && process.env) ? process.env : (window as any).process?.env || {};
-    if (this.keys.length === 0) return safeEnv.API_KEY || '';
+    if (this.keys.length === 0) {
+        const env = (typeof process !== 'undefined' && process.env) ? process.env : (window as any).process?.env || {};
+        return env.API_KEY || '';
+    }
 
     const now = Date.now();
     let attempts = 0;
@@ -54,22 +63,19 @@ class KeyManager {
 
       if (now > cooldownUntil) {
         const selectedKey = key;
-        // Advance pointer for next call
         this.currentIndex = (this.currentIndex + 1) % this.keys.length;
         return selectedKey;
       }
 
-      // Skip this key and try next
       this.currentIndex = (this.currentIndex + 1) % this.keys.length;
       attempts++;
     }
 
-    // Fallback: If all keys are in cooldown, return the first one
     return this.keys[0];
   }
 
   public markAsLimited(key: string) {
-    console.warn(`[KeyManager] Key rate-limited. Cooling down for 60s.`);
+    console.warn(`[KeyManager] ⚠️ Rate limit reached on current key. Switching to next available in pool.`);
     this.cooldowns.set(key, Date.now() + this.COOLDOWN_TIME);
   }
 
@@ -80,15 +86,14 @@ class KeyManager {
 
 const keyManager = new KeyManager();
 
-/**
- * Resilience Wrapper: Executes an AI operation with automatic retry on key rotation.
- */
 async function executeWithRotation<T>(operation: (ai: GoogleGenAI) => Promise<T>): Promise<T> {
   let lastError: any;
-  const maxRetries = Math.min(5, keyManager.getKeyCount() || 1);
+  const maxRetries = Math.max(3, keyManager.getKeyCount());
 
   for (let i = 0; i < maxRetries; i++) {
     const key = keyManager.getNextHealthyKey();
+    if (!key) throw new Error("API key is missing or not configured correctly.");
+    
     const ai = new GoogleGenAI({ apiKey: key });
 
     try {
@@ -97,13 +102,12 @@ async function executeWithRotation<T>(operation: (ai: GoogleGenAI) => Promise<T>
       lastError = err;
       const errorMsg = err.message?.toLowerCase() || '';
       
-      // Check for Rate Limit (429) or Quota Exceeded
       if (errorMsg.includes('429') || errorMsg.includes('quota') || errorMsg.includes('limit')) {
         keyManager.markAsLimited(key);
-        continue; // Try next key in pool
+        continue;
       }
       
-      throw err; // For other errors, fail immediately
+      throw err;
     }
   }
   throw lastError;
@@ -151,7 +155,7 @@ export async function decodeAudioData(
 }
 
 /**
- * AI Services with Pool Support
+ * AI Services
  */
 
 export const generateLessonSpeech = async (text: string) => {
@@ -176,9 +180,7 @@ export const getAITeacherResponse = async (prompt: string, context: string, user
       model: 'gemini-3-pro-preview',
       contents: `Rich Learning Context: ${context}\n\nStudent's Current Query: ${prompt}`,
       config: {
-        systemInstruction: `تو مربی فوق تخصص برنامه‌نویسی و همراه شخصی "${userName}" هستی. 
-        تو به سه منبع اطلاعاتی دسترسی داری: ۱. متن آموزشی درس، ۲. کد مرجع و ۳. کدی که دانشجو تایپ کرده.
-        وظیفه تو: توضیح منطق کد، مقایسه با مرجع و تشویق دانشجوست. پاسخ‌ها به فارسی باشد. کدهای مهم را در <hl>...</hl> قرار بده.`,
+        systemInstruction: `تو مربی فوق تخصص برنامه‌نویسی و همراه شخصی "${userName}" هستی. پاسخ‌ها به فارسی باشد. کدهای مهم را در <hl>...</hl> قرار بده.`,
       },
     });
     return response.text || '';
@@ -212,7 +214,8 @@ export const getAdminAuditReport = async (lesson: any, relatedLessonTitles: stri
 };
 
 export const connectLiveTeacher = async (callbacks: any, userName: string, context: string) => {
-  const ai = new GoogleGenAI({ apiKey: keyManager.getNextHealthyKey() });
+  const key = keyManager.getNextHealthyKey();
+  const ai = new GoogleGenAI({ apiKey: key });
   return ai.live.connect({
     model: 'gemini-2.5-flash-native-audio-preview-12-2025',
     callbacks,
@@ -221,7 +224,7 @@ export const connectLiveTeacher = async (callbacks: any, userName: string, conte
       speechConfig: {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
       },
-      systemInstruction: `تو مربی زنده و شخصی "${userName}" هستی. صمیمی و حرفه‌ای باش. کانتکست: ${context}`,
+      systemInstruction: `تو مربی زنده و شخصی "${userName}" هستی. کانتکست: ${context}`,
       outputAudioTranscription: {},
       inputAudioTranscription: {},
     }
