@@ -166,11 +166,7 @@ export const connectLiveTeacher = async (callbacks: any, userName: string, conte
       speechConfig: {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
       },
-      systemInstruction: `You are a world-class scientist and mentor. You are expert in all sciences but you focus ONLY on the current lesson context provided. 
-      Your tone is professional and balanced—not overly intimate, but helpful and encouraging. Avoid off-topic conversations.
-      You can see the student's typing progress and the code they are writing in the context. If they ask about their code, provide precise feedback.
-      Address the student as ${userName}. Do not introduce yourself with unnecessary titles. Start the scientific discussion directly.
-      Context: ${context}`,
+      systemInstruction: `Live Mentor Mode for ${userName}. Context: ${context}`,
     }
   });
 };
